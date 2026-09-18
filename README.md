@@ -1,87 +1,87 @@
 # API Gateway
 
-Servidor en Python (FastAPI + httpx) que actúa como **intermediario** entre los clientes y los
-microservicios. Recibe peticiones en `/api/{servicio}/{ruta}` y las reenvía a
-`{base_url del servicio}/{ruta}`, añadiendo resiliencia (reintentos y circuit breaker),
-trazabilidad (request id) y health checks.
+A Python server (FastAPI + httpx) that acts as an **intermediary** between clients and
+microservices. It receives requests at `/api/{service}/{path}` and forwards them to
+`{service base_url}/{path}`, adding resilience (retries and a circuit breaker), traceability
+(request ids) and health checks.
 
 ```
-Cliente ──► GET /api/users/items/1 ──► Gateway ──► GET http://users:8001/items/1
+Client ──► GET /api/users/items/1 ──► Gateway ──► GET http://users:8001/items/1
 ```
 
-## Características
+## Features
 
-- **Proxy transparente**: método, query params, body y cabeceras (incluidas las repetidas, como
-  `Set-Cookie`). Elimina cabeceras *hop-by-hop* y añade `X-Forwarded-For/Proto/Host`.
-- **Reintentos** con backoff exponencial, solo para métodos idempotentes (`GET`, `PUT`,
-  `DELETE`, …). `POST` y `PATCH` nunca se reintentan para no duplicar efectos.
-- **Circuit breaker por servicio**: si un microservicio falla repetidamente, el gateway deja de
-  llamarlo durante un tiempo y responde `503` al instante, sin afectar a los demás.
-- **Request ID**: reutiliza el `X-Request-ID` entrante (si es seguro) o genera uno; se propaga al
-  microservicio, se devuelve al cliente y aparece en cada línea de log.
-- **Errores consistentes** en JSON: `404` servicio desconocido, `502` servicio inaccesible,
-  `503` circuito abierto, `504` timeout.
-- **Health checks**: `/health` (liveness) y `/health/services` (estado de cada microservicio).
+- **Transparent proxy**: method, query params, body and headers (including repeated ones such as
+  `Set-Cookie`). Strips *hop-by-hop* headers and adds `X-Forwarded-For/Proto/Host`.
+- **Retries** with exponential backoff, only for idempotent methods (`GET`, `PUT`, `DELETE`, …).
+  `POST` and `PATCH` are never retried, so side effects are never duplicated.
+- **Per-service circuit breaker**: when a microservice keeps failing, the gateway stops calling it
+  for a while and answers `503` immediately, without affecting the other services.
+- **Request ID**: reuses the incoming `X-Request-ID` (when it is safe) or generates one; it is
+  propagated to the microservice, returned to the client and included in every log line.
+- **Consistent JSON errors**: `404` unknown service, `502` unreachable service, `503` open
+  circuit, `504` timeout.
+- **Health checks**: `/health` (liveness) and `/health/services` (status of each microservice).
 
-## Arquitectura
+## Architecture
 
 ```
 src/gateway/
-├── domain/            # Modelos, errores y puertos (interfaces). Sin dependencias externas.
+├── domain/            # Models, errors and ports (interfaces). No external dependencies.
 │   ├── models.py
 │   ├── exceptions.py
 │   └── ports.py       # ServiceRegistry, UpstreamClient (ABCs)
-├── application/       # Casos de uso: solo dependen de los puertos.
+├── application/       # Use cases: depend only on the ports.
 │   ├── proxy_service.py
 │   ├── health_service.py
 │   └── header_policy.py
-├── infrastructure/    # Implementaciones concretas de los puertos.
+├── infrastructure/    # Concrete implementations of the ports.
 │   ├── registry.py            # InMemoryServiceRegistry
 │   ├── httpx_client.py        # HttpxUpstreamClient
 │   └── resilience/
-│       ├── retry.py           # RetryingUpstreamClient (decorador)
-│       └── circuit_breaker.py # CircuitBreakerUpstreamClient (decorador)
-├── api/               # Capa HTTP (FastAPI): rutas, middleware, errores, adaptadores.
-├── config/settings.py # Configuración tipada (pydantic-settings).
-├── bootstrap.py       # Raíz de composición: único lugar que conoce las clases concretas.
-└── main.py            # Punto de entrada.
+│       ├── retry.py           # RetryingUpstreamClient (decorator)
+│       └── circuit_breaker.py # CircuitBreakerUpstreamClient (decorator)
+├── api/               # HTTP layer (FastAPI): routes, middleware, errors, adapters.
+├── config/settings.py # Typed configuration (pydantic-settings).
+├── bootstrap.py       # Composition root: the only place that knows the concrete classes.
+└── main.py            # Entry point.
 ```
 
-Las dependencias apuntan siempre hacia dentro: `api → application → domain ← infrastructure`.
+Dependencies always point inwards: `api → application → domain ← infrastructure`.
 
-La cadena de llamada a un microservicio se compone con decoradores que implementan la misma
-interfaz `UpstreamClient`:
+The call chain to a microservice is built from decorators that all implement the same
+`UpstreamClient` interface:
 
 ```
-ProxyService ─► CircuitBreakerUpstreamClient ─► RetryingUpstreamClient ─► HttpxUpstreamClient ─► red
+ProxyService ─► CircuitBreakerUpstreamClient ─► RetryingUpstreamClient ─► HttpxUpstreamClient ─► network
 ```
 
-### Principios SOLID aplicados
+### SOLID principles
 
-| Principio | Dónde |
+| Principle | Where |
 |---|---|
-| **S** — Responsabilidad única | Cada clase hace una cosa: `HeaderPolicy` filtra cabeceras, `RetryingUpstreamClient` reintenta, `CircuitBreaker` gestiona estados, `InMemoryServiceRegistry` resuelve servicios, `ProxyService` orquesta. |
-| **O** — Abierto/cerrado | Nuevo comportamiento = nueva clase. Ej.: añadir rate limiting o caché es escribir otro decorador de `UpstreamClient` y registrarlo en `bootstrap.py`, sin tocar `ProxyService`. Un nuevo error HTTP es una entrada en `api/errors.py`. |
-| **L** — Sustitución de Liskov | `HttpxUpstreamClient`, los decoradores de resiliencia y los fakes de los tests son intercambiables porque respetan el contrato de `UpstreamClient` (lanzan `UpstreamError`, nunca excepciones de httpx). |
-| **I** — Segregación de interfaces | Puertos pequeños y específicos: `ServiceRegistry` (2 métodos) y `UpstreamClient` (1 método). |
-| **D** — Inversión de dependencias | `ProxyService` y `HealthService` reciben abstracciones por constructor. Las implementaciones concretas solo se instancian en `bootstrap.py`. |
+| **S** — Single responsibility | Each class does one thing: `HeaderPolicy` filters headers, `RetryingUpstreamClient` retries, `CircuitBreaker` manages states, `InMemoryServiceRegistry` resolves services, `ProxyService` orchestrates. |
+| **O** — Open/closed | New behavior means a new class. E.g. adding rate limiting or caching is writing another `UpstreamClient` decorator and registering it in `bootstrap.py`, without touching `ProxyService`. A new HTTP error is one entry in `api/errors.py`. |
+| **L** — Liskov substitution | `HttpxUpstreamClient`, the resilience decorators and the test fakes are interchangeable because they honor the `UpstreamClient` contract (they raise `UpstreamError`, never httpx exceptions). |
+| **I** — Interface segregation | Small, focused ports: `ServiceRegistry` (2 methods) and `UpstreamClient` (1 method). |
+| **D** — Dependency inversion | `ProxyService` and `HealthService` receive abstractions through their constructors. Concrete implementations are only instantiated in `bootstrap.py`. |
 
-## Puesta en marcha
+## Getting started
 
-Requisitos: Python 3.11+.
+Requirements: Python 3.11+.
 
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate   |   Linux/macOS: source .venv/bin/activate
 pip install -e ".[dev]"
 
-cp .env.example .env      # y edita la lista de servicios
-gateway                   # o: python -m gateway
+cp .env.example .env      # then edit the list of services
+gateway                   # or: python -m gateway
 ```
 
-Documentación interactiva: <http://localhost:8000/docs>
+Interactive docs: <http://localhost:8000/docs>
 
-### Con Docker
+### With Docker
 
 ```bash
 docker compose up --build
@@ -89,27 +89,27 @@ curl http://localhost:8000/api/httpbin/get
 curl http://localhost:8000/health/services
 ```
 
-`docker-compose.yml` levanta el gateway y un microservicio de ejemplo (`go-httpbin`).
+`docker-compose.yml` starts the gateway plus a sample microservice (`go-httpbin`).
 
-## Configuración
+## Configuration
 
-Por variables de entorno con prefijo `GATEWAY_` (o en `.env`). Los valores anidados usan `__`.
+Through environment variables prefixed with `GATEWAY_` (or a `.env` file). Nested values use `__`.
 
-| Variable | Por defecto | Descripción |
+| Variable | Default | Description |
 |---|---|---|
-| `GATEWAY_SERVICES` | `[]` | JSON con los microservicios (ver abajo). |
-| `GATEWAY_HOST` / `GATEWAY_PORT` | `0.0.0.0` / `8000` | Dirección de escucha. |
+| `GATEWAY_SERVICES` | `[]` | JSON list of microservices (see below). |
+| `GATEWAY_HOST` / `GATEWAY_PORT` | `0.0.0.0` / `8000` | Listen address. |
 | `GATEWAY_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
-| `GATEWAY_MAX_CONNECTIONS` | `100` | Tamaño del pool de conexiones salientes. |
-| `GATEWAY_RETRY__MAX_ATTEMPTS` | `3` | Intentos totales (1 = sin reintentos). |
-| `GATEWAY_RETRY__BASE_DELAY_SECONDS` | `0.1` | Backoff: `base * 2^(intento-1)`. |
-| `GATEWAY_RETRY__MAX_DELAY_SECONDS` | `2.0` | Tope del backoff. |
-| `GATEWAY_RETRY__RETRY_ON_STATUS` | `[502,503,504]` | Códigos que se reintentan. |
-| `GATEWAY_CIRCUIT_BREAKER__FAILURE_THRESHOLD` | `5` | Fallos consecutivos para abrir el circuito. |
-| `GATEWAY_CIRCUIT_BREAKER__RECOVERY_TIMEOUT_SECONDS` | `30` | Tiempo abierto antes de probar de nuevo. |
-| `GATEWAY_CIRCUIT_BREAKER__FAILURE_STATUS_CODES` | `[502,503,504]` | Códigos que cuentan como fallo. |
+| `GATEWAY_MAX_CONNECTIONS` | `100` | Size of the outbound connection pool. |
+| `GATEWAY_RETRY__MAX_ATTEMPTS` | `3` | Total attempts (1 = no retries). |
+| `GATEWAY_RETRY__BASE_DELAY_SECONDS` | `0.1` | Backoff: `base * 2^(attempt-1)`. |
+| `GATEWAY_RETRY__MAX_DELAY_SECONDS` | `2.0` | Backoff cap. |
+| `GATEWAY_RETRY__RETRY_ON_STATUS` | `[502,503,504]` | Status codes that are retried. |
+| `GATEWAY_CIRCUIT_BREAKER__FAILURE_THRESHOLD` | `5` | Consecutive failures that open the circuit. |
+| `GATEWAY_CIRCUIT_BREAKER__RECOVERY_TIMEOUT_SECONDS` | `30` | Time the circuit stays open before a new attempt. |
+| `GATEWAY_CIRCUIT_BREAKER__FAILURE_STATUS_CODES` | `[502,503,504]` | Status codes counted as failures. |
 
-Cada servicio de `GATEWAY_SERVICES` admite:
+Each entry in `GATEWAY_SERVICES` accepts:
 
 ```json
 [
@@ -122,37 +122,37 @@ Cada servicio de `GATEWAY_SERVICES` admite:
 ]
 ```
 
-`name` es el segmento de la URL del gateway (`/api/users/...`): minúsculas, dígitos, `-` y `_`.
+`name` is the gateway URL segment (`/api/users/...`): lowercase letters, digits, `-` and `_`.
 
-## Tests y calidad
+## Tests and quality
 
 ```bash
-pytest --cov          # tests unitarios + integración, cobertura mínima 90 %
+pytest --cov          # unit + integration tests, 90% minimum coverage
 ruff check .          # lint
-ruff format --check . # formato
-mypy src              # tipado estricto
+ruff format --check . # formatting
+mypy src              # strict type checking
 ```
 
-- `tests/unit/`: cada clase por separado, usando fakes de los puertos (`tests/fakes.py`) y un
-  reloj falso, así que los tests de reintentos y circuit breaker no esperan tiempo real.
-- `tests/integration/`: la aplicación completa (middleware, rutas, lifespan, errores); solo se
-  sustituye la red hacia los microservicios con `httpx.MockTransport`.
+- `tests/unit/`: each class in isolation, using fakes of the ports (`tests/fakes.py`) and a fake
+  clock, so the retry and circuit breaker tests never wait in real time.
+- `tests/integration/`: the whole application (middleware, routes, lifespan, errors); only the
+  network to the microservices is replaced, using `httpx.MockTransport`.
 
-El workflow `.github/workflows/ci.yml` ejecuta todo lo anterior en cada push y pull request.
+The `.github/workflows/ci.yml` workflow runs all of the above on every push and pull request.
 
-## Extender el gateway
+## Extending the gateway
 
-- **Añadir un microservicio**: solo configuración (`GATEWAY_SERVICES`).
-- **Registro dinámico** (Consul, Kubernetes, base de datos): implementa `ServiceRegistry` y
-  cámbialo en `bootstrap.py`.
-- **Nueva política** (rate limiting, caché, métricas): escribe una clase que implemente
-  `UpstreamClient` envolviendo a otra y añádela a la cadena en `bootstrap.py`.
+- **Add a microservice**: configuration only (`GATEWAY_SERVICES`).
+- **Dynamic service discovery** (Consul, Kubernetes, a database): implement `ServiceRegistry` and
+  swap it in `bootstrap.py`.
+- **New policy** (rate limiting, caching, metrics): write a class that implements
+  `UpstreamClient` by wrapping another one, and add it to the chain in `bootstrap.py`.
 
-## Limitaciones conocidas
+## Known limitations
 
-- Los cuerpos de petición y respuesta se cargan completos en memoria (no hay *streaming*), así
-  que no está pensado para subir o descargar ficheros grandes.
-- No incluye autenticación de clientes; si el gateway es la puerta de entrada pública, conviene
-  añadirla (p. ej. como dependencia de FastAPI en `api/routes/proxy.py`).
-- El estado del circuit breaker vive en memoria de cada proceso: con varias réplicas, cada una
-  lleva su propia cuenta.
+- Request and response bodies are fully loaded into memory (no *streaming*), so it is not meant
+  for uploading or downloading large files.
+- There is no client authentication; if the gateway is the public entry point, add it (e.g. as a
+  FastAPI dependency in `api/routes/proxy.py`).
+- Circuit breaker state lives in each process's memory: with several replicas, each one keeps
+  its own count.

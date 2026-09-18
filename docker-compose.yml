@@ -10,6 +10,6 @@ services:
     depends_on:
       - httpbin
 
-  # Microservicio de ejemplo para probar el gateway.
+  # Sample microservice to try the gateway with.
   httpbin:
     image: mccutchen/go-httpbin

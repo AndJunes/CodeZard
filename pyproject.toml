@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "gateway"
 version = "0.1.0"
-description = "API Gateway que actúa como intermediario entre los clientes y los microservicios."
+description = "API Gateway that acts as an intermediary between clients and microservices."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
