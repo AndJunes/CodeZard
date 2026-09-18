@@ -1,0 +1,15 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      GATEWAY_LOG_LEVEL: INFO
+      GATEWAY_SERVICES: >-
+        [{"name": "httpbin", "base_url": "http://httpbin:8080", "health_path": "/status/200"}]
+    depends_on:
+      - httpbin
+
+  # Microservicio de ejemplo para probar el gateway.
+  httpbin:
+    image: mccutchen/go-httpbin
