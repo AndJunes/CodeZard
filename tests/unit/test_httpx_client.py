@@ -6,6 +6,7 @@ import pytest
 from gateway.domain.exceptions import UpstreamConnectionError, UpstreamError, UpstreamTimeoutError
 from gateway.domain.models import OutboundRequest, ServiceDefinition
 from gateway.infrastructure.httpx_client import HttpxUpstreamClient
+from tests.fakes import make_request
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -102,3 +103,80 @@ async def test_translates_transport_errors_into_domain_errors(
 
     assert exc_info.value.service_name == "users"
     assert exc_info.value.__cause__ is error
+
+
+async def test_stream_returns_before_the_body_is_read(
+    make_client: Callable[[Handler], HttpxUpstreamClient],
+    users_service: ServiceDefinition,
+) -> None:
+    """The point of streaming: the status is known long before the last byte."""
+    produced: list[str] = []
+
+    async def body() -> AsyncIterator[bytes]:
+        produced.append("first")
+        yield b"first"
+        produced.append("second")
+        yield b"second"
+
+    client = make_client(lambda _: httpx.Response(200, stream=_Stream(body())))
+
+    stream = await client.stream(make_request(users_service))
+
+    assert stream.status_code == 200
+    assert produced == []  # nothing was pulled from the body yet
+
+    assert [chunk async for chunk in stream.chunks] == [b"first", b"second"]
+    await stream.aclose()
+
+
+async def test_stream_translates_transport_errors_into_domain_errors(
+    make_client: Callable[[Handler], HttpxUpstreamClient],
+    users_service: ServiceDefinition,
+) -> None:
+    """Only up to the headers: past them there is no error left to translate."""
+
+    def fail(_: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    client = make_client(fail)
+
+    with pytest.raises(UpstreamConnectionError):
+        await client.stream(make_request(users_service))
+
+
+async def test_the_read_timeout_can_outlast_the_connect_timeout(
+    captured: list[httpx.Request],
+    make_client: Callable[[Handler], HttpxUpstreamClient],
+) -> None:
+    """A stream needs a long gap between chunks and a short handshake.
+
+    A single scalar cannot say both, and saying it once says it for all four channels.
+    """
+    service = ServiceDefinition(
+        name="events",
+        base_url="http://events.internal",
+        timeout_seconds=2.0,
+        read_timeout_seconds=600.0,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200)
+
+    await make_client(handler).stream(make_request(service))
+
+    assert captured[0].extensions["timeout"] == {
+        "connect": 2.0,
+        "read": 600.0,
+        "write": 2.0,
+        "pool": 2.0,
+    }
+
+
+class _Stream(httpx.AsyncByteStream):
+    def __init__(self, source: AsyncIterator[bytes]) -> None:
+        self._source = source
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._source:
+            yield chunk

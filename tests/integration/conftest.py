@@ -1,5 +1,6 @@
 """End-to-end fixtures: the real app, with only the network to downstream services faked."""
 
+import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 
@@ -17,6 +18,22 @@ from gateway.config.settings import (
 
 MAX_ATTEMPTS = 3
 FAILURE_THRESHOLD = 2
+
+
+class ChunkedBody(httpx.AsyncByteStream):
+    """Wraps an async generator so ``httpx.Response`` accepts it as a streaming body.
+
+    ``httpx.Response(stream=...)`` requires an ``AsyncByteStream``, not a bare generator.
+    Streaming tests need a body they can release chunk by chunk, which is the only way to
+    prove the gateway forwards the first one before the last one exists.
+    """
+
+    def __init__(self, source: AsyncIterator[bytes]) -> None:
+        self._source = source
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._source:
+            yield chunk
 
 
 class UpstreamStub:
@@ -90,3 +107,60 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         ) as client,
     ):
         yield client
+
+
+@pytest.fixture
+async def started_app(app: FastAPI) -> AsyncIterator[FastAPI]:
+    """The app with its lifespan entered, to be driven as raw ASGI.
+
+    Needed because ``httpx.ASGITransport`` collects every ``http.response.body`` message
+    and only builds the response once the last one arrives. That is fine for asserting on
+    status, headers and content, but it makes streaming invisible: through it, a gateway
+    that buffers and one that does not look identical. Tests about *when* bytes come out
+    have to watch the ASGI messages themselves.
+    """
+    async with app.router.lifespan_context(app):
+        yield app
+
+
+def http_scope(path: str, method: str = "GET") -> dict[str, object]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"gateway.test")],
+        "client": ("127.0.0.1", 12345),
+        "server": ("gateway.test", 80),
+    }
+
+
+class ClientConnection:
+    """A ``receive`` callable that behaves like a real server's.
+
+    The body arrives once; after that it does not answer again until the client hangs up.
+    That matters only for streamed responses: ``StreamingResponse`` watches for a
+    disconnect with ``while True: await receive()``, so a receive that keeps returning
+    ``http.request`` immediately turns that watch into a busy loop and starves the event
+    loop. A buffered response never listens, which is why this only shows up now.
+    """
+
+    def __init__(self, body: bytes = b"") -> None:
+        self._body = body
+        self._delivered = False
+        self._hung_up = asyncio.Event()
+
+    def hang_up(self) -> None:
+        self._hung_up.set()
+
+    async def __call__(self) -> dict[str, object]:
+        if not self._delivered:
+            self._delivered = True
+            return {"type": "http.request", "body": self._body, "more_body": False}
+        await self._hung_up.wait()
+        return {"type": "http.disconnect"}

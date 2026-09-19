@@ -1,6 +1,7 @@
 """Framework-agnostic models shared by every layer."""
 
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from enum import StrEnum
 from urllib.parse import quote
 
@@ -21,6 +22,20 @@ class ServiceDefinition:
     base_url: str
     timeout_seconds: float = 5.0
     health_path: str = "/health"
+    read_timeout_seconds: float | None = None
+    """Seconds allowed between two chunks; falls back to ``timeout_seconds``.
+
+    It exists because a streamed response changes what "read timeout" means. On a buffered
+    response it bounds the whole download; on a stream it bounds the *gap* between chunks.
+    A service that pushes events for ten minutes needs a long gap and a short connect, and
+    a single scalar cannot say both.
+    """
+
+    @property
+    def read_timeout(self) -> float:
+        if self.read_timeout_seconds is None:
+            return self.timeout_seconds
+        return self.read_timeout_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +83,30 @@ class UpstreamResponse:
     status_code: int
     headers: Headers = ()
     body: bytes = b""
+
+
+async def _no_chunks() -> AsyncIterator[bytes]:
+    return
+    yield b""  # pragma: no cover - makes the function an async generator
+
+
+async def _noop() -> None:
+    return
+
+
+@dataclass(frozen=True, slots=True)
+class UpstreamStream:
+    """A downstream response whose body has not been read yet.
+
+    Unlike ``UpstreamResponse`` this is **not** a self-contained value: it holds a live
+    connection. Whoever receives one owns it and must await ``aclose`` exactly once, even
+    if ``chunks`` is never consumed. Forgetting leaks a connection from the pool.
+    """
+
+    status_code: int
+    headers: Headers = ()
+    chunks: AsyncIterator[bytes] = field(default_factory=_no_chunks)
+    aclose: Callable[[], Awaitable[None]] = _noop
 
 
 class HealthStatus(StrEnum):

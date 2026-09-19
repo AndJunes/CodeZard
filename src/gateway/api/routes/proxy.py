@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Request, Response
 
-from gateway.api.adapters import to_inbound_request, to_response
+from gateway.api.adapters import to_inbound_request, to_streaming_response
 from gateway.api.dependencies import ProxyServiceDep
 from gateway.application.proxy_service import ProxyService
 
@@ -25,6 +25,12 @@ async def proxy_root(service_name: str, request: Request, proxy: ProxyServiceDep
 
 
 async def _forward(proxy: ProxyService, service_name: str, path: str, request: Request) -> Response:
+    """Every proxied response is streamed, not just the long ones.
+
+    Deciding per response — say, by looking for ``text/event-stream`` — would mean two code
+    paths and a guess about which one a service needs. Forwarding bytes as they arrive is
+    what a proxy is supposed to do; a short body simply arrives in one chunk.
+    """
     inbound = await to_inbound_request(request, path)
-    upstream = await proxy.forward(service_name, inbound)
-    return to_response(upstream)
+    upstream = await proxy.stream(service_name, inbound)
+    return to_streaming_response(upstream)
