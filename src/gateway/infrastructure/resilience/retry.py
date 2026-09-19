@@ -70,6 +70,7 @@ class RetryingUpstreamClient(UpstreamClient):
                     response.status_code
                 ):
                     return response
+                await response.aclose()  # discarded: free its connection before trying again
                 reason = f"status {response.status_code}"
 
             delay = self._policy.delay_for(attempt)

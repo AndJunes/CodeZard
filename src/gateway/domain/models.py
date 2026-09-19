@@ -1,6 +1,8 @@
 """Framework-agnostic models shared by every layer."""
 
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from enum import StrEnum
 from urllib.parse import quote
 
@@ -21,6 +23,9 @@ class ServiceDefinition:
     base_url: str
     timeout_seconds: float = 5.0
     health_path: str = "/health"
+    # Sent on every request to the service (e.g. a shared secret). Kept out of repr: they
+    # usually hold credentials, and a repr ends up in logs.
+    headers: Headers = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +66,23 @@ class OutboundRequest:
         return self.method.upper() in IDEMPOTENT_METHODS
 
 
+class ByteStream(ABC):
+    """A response body relayed chunk by chunk as it arrives, instead of all at once.
+
+    Whoever ends up holding it must call ``aclose``, even without iterating it, so the
+    connection behind it is released. Like ``UpstreamClient``, implementations raise
+    ``UpstreamError`` subclasses, never transport-specific exceptions.
+    """
+
+    @abstractmethod
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        """Yield the body chunks in order."""
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Release the connection. Safe to call more than once."""
+
+
 @dataclass(frozen=True, slots=True)
 class UpstreamResponse:
     """The response produced by a downstream service."""
@@ -68,6 +90,13 @@ class UpstreamResponse:
     status_code: int
     headers: Headers = ()
     body: bytes = b""
+    stream: ByteStream | None = None
+    """Set instead of ``body`` when the response must reach the client as it is produced."""
+
+    async def aclose(self) -> None:
+        """Release a streamed body. A no-op for buffered ones."""
+        if self.stream is not None:
+            await self.stream.aclose()
 
 
 class HealthStatus(StrEnum):

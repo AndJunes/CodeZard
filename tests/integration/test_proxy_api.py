@@ -4,7 +4,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from tests.integration.conftest import FAILURE_THRESHOLD, MAX_ATTEMPTS, UpstreamStub
+from tests.integration.conftest import (
+    FAILURE_THRESHOLD,
+    MAX_ATTEMPTS,
+    ORDERS_TOKEN,
+    UpstreamStub,
+)
 
 
 async def test_forwards_get_requests_and_returns_the_upstream_response(
@@ -53,6 +58,18 @@ async def test_forwards_request_bodies(client: httpx.AsyncClient, upstream: Upst
     assert sent.method == "POST"
     assert sent.content == b'{"name":"Ada"}'
     assert sent.headers["content-type"] == "application/json"
+
+
+async def test_injects_the_service_credential_and_ignores_the_client_one(
+    client: httpx.AsyncClient, upstream: UpstreamStub
+) -> None:
+    await client.post("/api/orders/chat", json={}, headers={"x-orders-token": "forged"})
+    await client.get("/api/users/items")
+
+    to_orders, to_users = upstream.requests
+    assert to_orders.headers.get_list("x-orders-token") == [ORDERS_TOKEN]
+    # A credential belongs to its service: no other service ever receives it.
+    assert "x-orders-token" not in to_users.headers
 
 
 async def test_passes_upstream_client_errors_through_unchanged(

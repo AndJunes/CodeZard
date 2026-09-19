@@ -1,3 +1,5 @@
+import dataclasses
+
 from gateway.application.health_service import HealthService
 from gateway.domain.exceptions import UpstreamConnectionError
 from gateway.domain.models import (
@@ -9,7 +11,7 @@ from gateway.domain.models import (
 )
 from gateway.domain.ports import UpstreamClient
 from gateway.infrastructure.registry import InMemoryServiceRegistry
-from tests.fakes import ScriptedUpstreamClient
+from tests.fakes import FakeByteStream, ScriptedUpstreamClient
 
 
 class ClientPerService(UpstreamClient):
@@ -30,6 +32,21 @@ async def test_healthy_service_is_up_with_latency(users_service: ServiceDefiniti
 
     assert health == ServiceHealth(name="users", status=HealthStatus.UP, latency_ms=250.0)
     assert (client.requests[0].method, client.requests[0].path) == ("GET", "/health")
+
+
+async def test_sends_the_service_headers_and_releases_streamed_bodies(
+    users_service: ServiceDefinition,
+) -> None:
+    guarded = dataclasses.replace(users_service, headers=(("x-token", "secret"),))
+    stream = FakeByteStream()
+    client = ScriptedUpstreamClient(UpstreamResponse(status_code=200, stream=stream))
+    service = HealthService(InMemoryServiceRegistry([guarded]), client)
+
+    health = await service.check(guarded)
+
+    assert health.status is HealthStatus.UP
+    assert client.requests[0].headers == (("x-token", "secret"),)
+    assert stream.closed
 
 
 async def test_error_status_marks_the_service_down(users_service: ServiceDefinition) -> None:

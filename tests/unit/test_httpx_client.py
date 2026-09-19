@@ -9,6 +9,26 @@ from gateway.infrastructure.httpx_client import HttpxUpstreamClient
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
+SSE = {"content-type": "text/event-stream; charset=utf-8"}
+
+
+class UpstreamBody(httpx.AsyncByteStream):
+    """A response body that sends ``chunks``, then optionally fails, and records its release."""
+
+    def __init__(self, *chunks: bytes, error: Exception | None = None) -> None:
+        self._chunks = chunks
+        self._error = error
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+        if self._error is not None:
+            raise self._error
+
+    async def aclose(self) -> None:
+        self.closed = True
+
 
 @pytest.fixture
 def captured() -> list[httpx.Request]:
@@ -102,3 +122,85 @@ async def test_translates_transport_errors_into_domain_errors(
 
     assert exc_info.value.service_name == "users"
     assert exc_info.value.__cause__ is error
+
+
+async def test_buffers_regular_bodies_and_releases_the_connection(
+    users_service: ServiceDefinition, make_client: Callable[[Handler], HttpxUpstreamClient]
+) -> None:
+    body = UpstreamBody(b'{"id": ', b"1}")
+    client = make_client(lambda _: httpx.Response(200, stream=body))
+
+    response = await client.send(OutboundRequest(service=users_service, method="GET", path="/"))
+
+    assert response.body == b'{"id": 1}'
+    assert response.stream is None
+    assert body.closed
+
+
+async def test_relays_event_streams_chunk_by_chunk(
+    users_service: ServiceDefinition, make_client: Callable[[Handler], HttpxUpstreamClient]
+) -> None:
+    body = UpstreamBody(b"data: 1\n\n", b"data: 2\n\n")
+    client = make_client(lambda _: httpx.Response(200, headers=SSE, stream=body))
+
+    response = await client.send(OutboundRequest(service=users_service, method="POST", path="/"))
+
+    assert response.body == b""
+    assert response.stream is not None
+    assert [chunk async for chunk in response.stream] == [b"data: 1\n\n", b"data: 2\n\n"]
+    assert ("content-type", SSE["content-type"]) in response.headers
+
+
+async def test_closing_an_unread_stream_releases_the_connection(
+    users_service: ServiceDefinition, make_client: Callable[[Handler], HttpxUpstreamClient]
+) -> None:
+    body = UpstreamBody(b"data: 1\n\n")
+    client = make_client(lambda _: httpx.Response(200, headers=SSE, stream=body))
+    response = await client.send(OutboundRequest(service=users_service, method="POST", path="/"))
+
+    await response.aclose()
+
+    assert body.closed
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (httpx.ReadTimeout("timed out"), UpstreamTimeoutError),
+        (httpx.ReadError("connection reset"), UpstreamConnectionError),
+    ],
+)
+async def test_translates_errors_in_the_middle_of_a_stream(
+    users_service: ServiceDefinition,
+    make_client: Callable[[Handler], HttpxUpstreamClient],
+    error: httpx.TransportError,
+    expected: type[UpstreamError],
+) -> None:
+    body = UpstreamBody(b"data: 1\n\n", error=error)
+    client = make_client(lambda _: httpx.Response(200, headers=SSE, stream=body))
+    response = await client.send(OutboundRequest(service=users_service, method="POST", path="/"))
+    assert response.stream is not None
+    stream = response.stream
+    received: list[bytes] = []
+
+    async def drain() -> None:
+        async for chunk in stream:
+            received.append(chunk)
+
+    with pytest.raises(expected) as exc_info:
+        await drain()
+
+    assert received == [b"data: 1\n\n"]
+    assert exc_info.value.__cause__ is error
+
+
+async def test_translates_errors_while_reading_a_regular_body(
+    users_service: ServiceDefinition, make_client: Callable[[Handler], HttpxUpstreamClient]
+) -> None:
+    body = UpstreamBody(b"partial", error=httpx.ReadTimeout("timed out"))
+    client = make_client(lambda _: httpx.Response(200, stream=body))
+
+    with pytest.raises(UpstreamTimeoutError):
+        await client.send(OutboundRequest(service=users_service, method="GET", path="/"))
+
+    assert body.closed

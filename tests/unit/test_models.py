@@ -6,7 +6,9 @@ from gateway.domain.models import (
     OutboundRequest,
     ServiceDefinition,
     ServiceHealth,
+    UpstreamResponse,
 )
+from tests.fakes import FakeByteStream
 
 
 @pytest.mark.parametrize(
@@ -57,3 +59,11 @@ def test_health_report_is_healthy_only_when_every_service_is_up() -> None:
 
 def test_empty_health_report_is_healthy() -> None:
     assert HealthReport(services=()).is_healthy
+
+
+async def test_aclose_releases_a_streamed_body() -> None:
+    stream = FakeByteStream(b"data: 1\n\n")
+
+    await UpstreamResponse(status_code=200, stream=stream).aclose()
+
+    assert stream.closed

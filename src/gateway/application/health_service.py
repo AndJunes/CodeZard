@@ -31,12 +31,15 @@ class HealthService:
         return HealthReport(services=tuple(results))
 
     async def check(self, service: ServiceDefinition) -> ServiceHealth:
-        request = OutboundRequest(service=service, method="GET", path=service.health_path)
+        request = OutboundRequest(
+            service=service, method="GET", path=service.health_path, headers=service.headers
+        )
         started = self._timer()
         try:
             response = await self._client.send(request)
         except UpstreamError as exc:
             return ServiceHealth(name=service.name, status=HealthStatus.DOWN, detail=str(exc))
+        await response.aclose()  # only the status matters
 
         latency_ms = round((self._timer() - started) * 1000, 2)
         if 200 <= response.status_code < 300:

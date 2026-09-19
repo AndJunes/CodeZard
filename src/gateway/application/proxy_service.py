@@ -27,7 +27,7 @@ class ProxyService:
             service=service,
             method=inbound.method,
             path=inbound.path,
-            headers=self._header_policy.for_upstream(inbound),
+            headers=self._header_policy.for_upstream(inbound, service.headers),
             query_params=inbound.query_params,
             body=inbound.body,
         )

@@ -52,3 +52,55 @@ def test_rejects_invalid_service_names(name: str) -> None:
 def test_rejects_invalid_base_urls(base_url: str) -> None:
     with pytest.raises(ValidationError):
         ServiceSettings(name="users", base_url=base_url)
+
+
+def test_service_headers_are_loaded_but_never_shown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "GATEWAY_SERVICES",
+        json.dumps(
+            [
+                {
+                    "name": "mirag",
+                    "base_url": "http://mirag:8000",
+                    "headers": {"X-Mirag-Token": "s3cret-value"},
+                }
+            ]
+        ),
+    )
+
+    settings = Settings(_env_file=None)
+    (definition,) = settings.service_definitions()
+
+    assert definition.headers == (("X-Mirag-Token", "s3cret-value"),)
+    assert "s3cret-value" not in repr(settings)
+    assert "s3cret-value" not in repr(definition)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"X Token": "t"}, {"": "t"}, {"X-Token:": "t"}, {"X-Token": ""}, {"X-Token": "a\nb"}],
+)
+def test_rejects_invalid_service_headers(headers: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        ServiceSettings(name="mirag", base_url="http://mirag:8000", headers=headers)
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        # The header value itself is invalid.
+        {"name": "mirag", "base_url": "http://mirag:8000", "headers": {"X-Token": "s3cret\r\n"}},
+        # Another field is wrong, and the error would quote the whole entry.
+        {"base_url": "http://mirag:8000", "headers": {"X-Token": "s3cret"}},
+    ],
+)
+def test_configuration_errors_never_quote_header_values(
+    monkeypatch: pytest.MonkeyPatch, service: dict[str, object]
+) -> None:
+    monkeypatch.setenv("GATEWAY_SERVICES", json.dumps([service]))
+
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None)
+
+    assert "services.0" in str(exc_info.value)
+    assert "s3cret" not in str(exc_info.value)
