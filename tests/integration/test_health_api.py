@@ -63,11 +63,3 @@ async def test_services_health_is_degraded_when_a_service_is_down(
         "latency_ms": None,
         "detail": "Service 'orders' is unreachable",
     }
-
-
-async def test_openapi_documents_health_but_not_the_catch_all_proxy(
-    client: httpx.AsyncClient,
-) -> None:
-    paths = (await client.get("/openapi.json")).json()["paths"]
-
-    assert set(paths) == {"/health", "/health/services"}

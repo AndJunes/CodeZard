@@ -48,6 +48,15 @@ async def test_maps_gateway_paths_to_service_urls(
     assert str(upstream.requests[0].url) == expected_url
 
 
+async def test_accepts_the_slashes_of_the_path_percent_encoded(
+    client: httpx.AsyncClient, upstream: UpstreamStub
+) -> None:
+    # What Swagger UI sends: it encodes the whole `path` parameter as a single segment.
+    await client.get("/api/users/items%2F1")
+
+    assert str(upstream.requests[0].url) == "http://users.internal/items/1"
+
+
 async def test_forwards_request_bodies(client: httpx.AsyncClient, upstream: UpstreamStub) -> None:
     upstream.respond_with(httpx.Response(201, json={"id": 7}))
 

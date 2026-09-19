@@ -5,6 +5,7 @@ import logging
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
+from gateway.api.schemas import ErrorDetail, ErrorResponse
 from gateway.domain.exceptions import (
     CircuitOpenError,
     GatewayError,
@@ -33,16 +34,14 @@ def classify(exc: Exception) -> tuple[int, str]:
 
 
 def error_response(request: Request, status_code: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {
-                "code": code,
-                "message": message,
-                "request_id": getattr(request.state, "request_id", None),
-            }
-        },
+    body = ErrorResponse(
+        error=ErrorDetail(
+            code=code,
+            message=message,
+            request_id=getattr(request.state, "request_id", None),
+        )
     )
+    return JSONResponse(status_code=status_code, content=body.model_dump())
 
 
 async def _handle_gateway_error(request: Request, exc: Exception) -> JSONResponse:

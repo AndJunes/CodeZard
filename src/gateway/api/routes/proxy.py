@@ -1,25 +1,78 @@
 """Catch-all routes: ``/api/{service}/{path}`` is forwarded to ``{service_base_url}/{path}``."""
 
-from fastapi import APIRouter, Request, Response
+from typing import Annotated
+
+from fastapi import APIRouter, Path, Request, Response
 
 from gateway.api.adapters import to_inbound_request, to_response
 from gateway.api.dependencies import ProxyServiceDep
+from gateway.api.openapi import JsonObject, gateway_error_responses
 from gateway.application.proxy_service import ProxyService
 
 PROXIED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
-# Excluded from OpenAPI: a catch-all route has no meaningful schema to document.
-router = APIRouter(prefix="/api", tags=["proxy"], include_in_schema=False)
+# Proxied like the rest, but kept out of Swagger: they would add entries and no information.
+_UNDOCUMENTED_METHODS = frozenset({"HEAD", "OPTIONS"})
+_METHODS_WITH_BODY = frozenset({"POST", "PUT", "PATCH"})
+
+_DESCRIPTION = """\
+Forwards the request to `{base_url of service_name}/{path}`: same method, query string, body
+and headers, minus the hop-by-hop ones. The gateway adds `X-Forwarded-For`, `X-Forwarded-Proto`,
+`X-Forwarded-Host`, `X-Request-ID` and the headers configured for the service, which replace
+any client header of the same name.
+
+`/api/{service_name}` alone (no trailing path) reaches the root of the service.
+"""
+
+_ANY_BODY = {
+    "requestBody": {
+        "required": False,
+        "description": "Forwarded byte for byte, whatever its content type.",
+        "content": {"application/json": {"schema": {}, "example": {"name": "Ada"}}},
+    }
+}
+
+_RESPONSES: dict[int | str, JsonObject] = {
+    **gateway_error_responses(404, 502, 503, 504),
+    "default": {"description": "Any other status the service answers, relayed unchanged."},
+}
+
+ServiceName = Annotated[
+    str,
+    Path(description="A service registered in `GATEWAY_SERVICES`.", examples=["httpbin"]),
+]
+ServicePath = Annotated[
+    str,
+    Path(description="The path inside the service. It may contain `/`.", examples=["anything/1"]),
+]
+
+router = APIRouter(prefix="/api", tags=["proxy"])
 
 
-@router.api_route("/{service_name}/{path:path}", methods=PROXIED_METHODS)
 async def proxy_path(
-    service_name: str, path: str, request: Request, proxy: ProxyServiceDep
+    service_name: ServiceName, path: ServicePath, request: Request, proxy: ProxyServiceDep
 ) -> Response:
     return await _forward(proxy, service_name, path, request)
 
 
-@router.api_route("/{service_name}", methods=PROXIED_METHODS)
+# One route per method: a single multi-method route would give every method the same
+# OpenAPI operation id.
+for _method in PROXIED_METHODS:
+    router.add_api_route(
+        "/{service_name}/{path:path}",
+        proxy_path,
+        methods=[_method],
+        operation_id=f"proxy_{_method.lower()}",
+        summary=f"Forward a {_method} request to a service",
+        description=_DESCRIPTION,
+        response_description="The service's response, relayed unchanged.",
+        responses=_RESPONSES,
+        openapi_extra=_ANY_BODY if _method in _METHODS_WITH_BODY else None,
+        include_in_schema=_method not in _UNDOCUMENTED_METHODS,
+    )
+
+
+@router.api_route("/{service_name}", methods=PROXIED_METHODS, include_in_schema=False)
 async def proxy_root(service_name: str, request: Request, proxy: ProxyServiceDep) -> Response:
     return await _forward(proxy, service_name, "", request)
 
