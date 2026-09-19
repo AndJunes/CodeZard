@@ -1,5 +1,6 @@
 import httpx
 
+from gateway.domain.models import ServiceInstance
 from tests.integration.conftest import ORDERS_TOKEN, UpstreamStub
 
 
@@ -56,10 +57,16 @@ async def test_services_health_is_degraded_when_a_service_is_down(
     assert body["status"] == "degraded"
     services = {service["name"]: service for service in body["services"]}
     assert services["users"]["status"] == "up"
-    assert isinstance(services["users"]["latency_ms"], float)
+    assert isinstance(services["users"]["instances"][0]["latency_ms"], float)
     assert services["orders"] == {
         "name": "orders",
         "status": "down",
-        "latency_ms": None,
-        "detail": "Service 'orders' is unreachable",
+        "instances": [
+            {
+                "id": ServiceInstance("http://orders.internal/v1").id,
+                "status": "down",
+                "latency_ms": None,
+                "detail": "Service 'orders' is unreachable",
+            }
+        ],
     }

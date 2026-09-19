@@ -9,13 +9,23 @@ class LivenessResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
-class ServiceHealthResponse(BaseModel):
-    name: str = Field(description="The service name, as registered in `GATEWAY_SERVICES`.")
-    status: HealthStatus
+class InstanceHealthResponse(BaseModel):
+    id: str = Field(
+        description="The instance id. `/api/{service}@{id}/...` sends a request to this server."
+    )
+    status: Literal[HealthStatus.UP, HealthStatus.DOWN]
     latency_ms: float | None = Field(
         default=None, description="Time the health check took. `null` when there was no answer."
     )
-    detail: str | None = Field(default=None, description="Why the service is `down`.")
+    detail: str | None = Field(default=None, description="Why the instance is `down`.")
+
+
+class ServiceHealthResponse(BaseModel):
+    name: str = Field(description="The service name, as registered in `GATEWAY_SERVICES`.")
+    status: HealthStatus = Field(
+        description="`up` when every instance is up, `down` when none is, `degraded` otherwise."
+    )
+    instances: list[InstanceHealthResponse]
 
 
 class ServicesHealthResponse(BaseModel):
@@ -25,12 +35,35 @@ class ServicesHealthResponse(BaseModel):
                 {
                     "status": "degraded",
                     "services": [
-                        {"name": "httpbin", "status": "up", "latency_ms": 3.41, "detail": None},
+                        {
+                            "name": "httpbin",
+                            "status": "up",
+                            "instances": [
+                                {
+                                    "id": "0e5a7c21",
+                                    "status": "up",
+                                    "latency_ms": 3.41,
+                                    "detail": None,
+                                }
+                            ],
+                        },
                         {
                             "name": "mirag",
-                            "status": "down",
-                            "latency_ms": None,
-                            "detail": "Service 'mirag' is unreachable",
+                            "status": "degraded",
+                            "instances": [
+                                {
+                                    "id": "3fa1c2d0",
+                                    "status": "up",
+                                    "latency_ms": 8.02,
+                                    "detail": None,
+                                },
+                                {
+                                    "id": "9b2e4d11",
+                                    "status": "down",
+                                    "latency_ms": None,
+                                    "detail": "Service 'mirag' is unreachable",
+                                },
+                            ],
                         },
                     ],
                 }
@@ -51,8 +84,15 @@ class ServicesHealthResponse(BaseModel):
                 ServiceHealthResponse(
                     name=service.name,
                     status=service.status,
-                    latency_ms=service.latency_ms,
-                    detail=service.detail,
+                    instances=[
+                        InstanceHealthResponse(
+                            id=instance.id,
+                            status=instance.status,
+                            latency_ms=instance.latency_ms,
+                            detail=instance.detail,
+                        )
+                        for instance in service.instances
+                    ],
                 )
                 for service in report.services
             ],

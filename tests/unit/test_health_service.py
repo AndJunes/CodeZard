@@ -4,6 +4,7 @@ from gateway.application.health_service import HealthService
 from gateway.domain.exceptions import UpstreamConnectionError
 from gateway.domain.models import (
     HealthStatus,
+    InstanceHealth,
     OutboundRequest,
     ServiceDefinition,
     ServiceHealth,
@@ -30,7 +31,11 @@ async def test_healthy_service_is_up_with_latency(users_service: ServiceDefiniti
 
     health = await service.check(users_service)
 
-    assert health == ServiceHealth(name="users", status=HealthStatus.UP, latency_ms=250.0)
+    instance_id = users_service.instances[0].id
+    assert health == ServiceHealth(
+        name="users",
+        instances=(InstanceHealth(id=instance_id, status=HealthStatus.UP, latency_ms=250.0),),
+    )
     assert (client.requests[0].method, client.requests[0].path) == ("GET", "/health")
 
 
@@ -56,7 +61,7 @@ async def test_error_status_marks_the_service_down(users_service: ServiceDefinit
     health = await service.check(users_service)
 
     assert health.status is HealthStatus.DOWN
-    assert health.detail == "Unexpected status code 500"
+    assert health.instances[0].detail == "Unexpected status code 500"
 
 
 async def test_unreachable_service_is_down(users_service: ServiceDefinition) -> None:
@@ -65,9 +70,40 @@ async def test_unreachable_service_is_down(users_service: ServiceDefinition) -> 
 
     health = await service.check(users_service)
 
-    assert health == ServiceHealth(
-        name="users", status=HealthStatus.DOWN, detail="Service 'users' is unreachable"
+    assert health.instances == (
+        InstanceHealth(
+            id=users_service.instances[0].id,
+            status=HealthStatus.DOWN,
+            detail="Service 'users' is unreachable",
+        ),
     )
+
+
+async def test_checks_every_instance_on_its_own() -> None:
+    agent = ServiceDefinition(name="agent", base_urls=("http://a.internal", "http://b.internal"))
+
+    class DownOnB(UpstreamClient):
+        def __init__(self) -> None:
+            self.requests: list[OutboundRequest] = []
+
+        async def send(self, request: OutboundRequest) -> UpstreamResponse:
+            self.requests.append(request)
+            if request.url.startswith("http://b.internal"):
+                raise UpstreamConnectionError("agent")
+            return UpstreamResponse(status_code=200)
+
+    client = DownOnB()
+    health = await HealthService(InMemoryServiceRegistry([agent]), client).check(agent)
+
+    assert sorted(request.url for request in client.requests) == [
+        "http://a.internal/health",
+        "http://b.internal/health",
+    ]
+    assert [(i.id, i.status) for i in health.instances] == [
+        (agent.instances[0].id, HealthStatus.UP),
+        (agent.instances[1].id, HealthStatus.DOWN),
+    ]
+    assert health.status is HealthStatus.DEGRADED
 
 
 async def test_check_all_reports_every_registered_service(

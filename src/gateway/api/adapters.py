@@ -12,6 +12,9 @@ from gateway.domain.models import ByteStream, InboundRequest, UpstreamResponse
 
 logger = logging.getLogger(__name__)
 
+INSTANCE_HEADER = "x-gateway-instance"
+"""Names the instance that answered: ``/api/{service}@{instance}/...`` reaches it again."""
+
 
 async def to_inbound_request(request: Request, path: str) -> InboundRequest:
     return InboundRequest(
@@ -38,6 +41,9 @@ def to_response(upstream: UpstreamResponse) -> Response:
     for name, value in upstream.headers:
         # append (not set) keeps repeated headers such as Set-Cookie.
         response.headers.append(name, value)
+    if upstream.instance_id is not None:
+        # Set after the service's headers, so a service cannot pass itself off as another one.
+        response.headers[INSTANCE_HEADER] = upstream.instance_id
     return response
 
 

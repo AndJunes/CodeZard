@@ -3,7 +3,8 @@
 A Python server (FastAPI + httpx) that acts as an **intermediary** between clients and
 microservices. It receives requests at `/api/{service}/{path}` and forwards them to
 `{service base_url}/{path}`, adding resilience (retries and a circuit breaker), traceability
-(request ids) and health checks.
+(request ids) and health checks. A service can run on several servers at once: the gateway
+spreads requests among them and moves on to another one when a server fails.
 
 ```
 Client ──► GET /api/users/items/1 ──► Gateway ──► GET http://users:8001/items/1
@@ -20,8 +21,13 @@ Client ──► GET /api/users/items/1 ──► Gateway ──► GET http://u
   secret never reaches a browser.
 - **Retries** with exponential backoff, only for idempotent methods (`GET`, `PUT`, `DELETE`, …).
   `POST` and `PATCH` are never retried, so side effects are never duplicated.
-- **Per-service circuit breaker**: when a microservice keeps failing, the gateway stops calling it
-  for a while and answers `503` immediately, without affecting the other services.
+- **Several instances per service**: requests are spread round-robin among the servers of a
+  service, and one that is down or failing is skipped. `X-Gateway-Instance` names the server
+  that answered, and `/api/{service}@{instance}/...` goes back to it (see
+  [Several instances of a service](#several-instances-of-a-service)).
+- **Per-instance circuit breaker**: when a server keeps failing, the gateway stops calling it for
+  a while, without affecting the other services or the other instances of the same one. `503`
+  only when every instance of the service is in that state.
 - **Request ID**: reuses the incoming `X-Request-ID` (when it is safe) or generates one; it is
   propagated to the microservice, returned to the client and included in every log line.
 - **Consistent JSON errors**: `404` unknown service, `502` unreachable service, `503` open
@@ -46,8 +52,9 @@ src/gateway/
 │   ├── registry.py            # InMemoryServiceRegistry
 │   ├── httpx_client.py        # HttpxUpstreamClient
 │   └── resilience/
-│       ├── retry.py           # RetryingUpstreamClient (decorator)
-│       └── circuit_breaker.py # CircuitBreakerUpstreamClient (decorator)
+│       ├── load_balancer.py   # LoadBalancingUpstreamClient (decorator)
+│       ├── circuit_breaker.py # CircuitBreakerUpstreamClient (decorator)
+│       └── retry.py           # RetryingUpstreamClient (decorator)
 ├── api/               # HTTP layer (FastAPI): routes, middleware, errors, adapters.
 │   ├── openapi.py     # The OpenAPI document behind Swagger UI.
 │   └── contracts/     # Routes of downstream services documented in Swagger (mirag.py).
@@ -62,14 +69,16 @@ The call chain to a microservice is built from decorators that all implement the
 `UpstreamClient` interface:
 
 ```
-ProxyService ─► CircuitBreakerUpstreamClient ─► RetryingUpstreamClient ─► HttpxUpstreamClient ─► network
+ProxyService ─► LoadBalancing ─► CircuitBreaker ─► Retrying ─► HttpxUpstreamClient ─► network
+                 (picks the      (one per          (same
+                  instance)       instance)         instance)
 ```
 
 ### SOLID principles
 
 | Principle | Where |
 |---|---|
-| **S** — Single responsibility | Each class does one thing: `HeaderPolicy` filters headers, `RetryingUpstreamClient` retries, `CircuitBreaker` manages states, `InMemoryServiceRegistry` resolves services, `ProxyService` orchestrates. |
+| **S** — Single responsibility | Each class does one thing: `HeaderPolicy` filters headers, `LoadBalancingUpstreamClient` picks an instance, `RetryingUpstreamClient` retries, `CircuitBreaker` manages states, `InMemoryServiceRegistry` resolves services, `ProxyService` orchestrates. |
 | **O** — Open/closed | New behavior means a new class. E.g. adding rate limiting or caching is writing another `UpstreamClient` decorator and registering it in `bootstrap.py`, without touching `ProxyService`. A new HTTP error is one entry in `api/errors.py`. |
 | **L** — Liskov substitution | `HttpxUpstreamClient`, the resilience decorators and the test fakes are interchangeable because they honor the `UpstreamClient` contract (they raise `UpstreamError`, never httpx exceptions). |
 | **I** — Interface segregation | Small, focused ports: `ServiceRegistry` (2 methods) and `UpstreamClient` (1 method). |
@@ -88,27 +97,31 @@ sequenceDiagram
     participant C as Client
     participant MW as Middleware
     participant P as ProxyService
+    participant LB as Load balancer
     participant CB as Circuit breaker
     participant RT as Retry
     participant H as httpx client
-    participant S as Service (mirag)
+    participant S as Instance of mirag
 
     C->>MW: GET /api/mirag/api/v1/health
     MW->>MW: assign the request id
     MW->>P: InboundRequest (route + adapter)
     P->>P: look up "mirag" (unknown: 404)
     P->>P: filter headers, add X-Forwarded-*, X-Request-ID, X-Mirag-Token
-    P->>CB: OutboundRequest
-    CB->>RT: only if the circuit lets it through (open: 503)
+    P->>LB: OutboundRequest
+    LB->>LB: next instance in turn (or the pinned one)
+    LB->>CB: OutboundRequest for that instance
+    CB->>RT: only if its circuit lets it through (open: next instance)
     RT->>H: attempt 1 of N
-    H->>S: GET http://mirag:8000/api/v1/health
+    H->>S: GET http://mirag-1:8000/api/v1/health
     S-->>H: 200 + body
     H-->>RT: UpstreamResponse
     RT-->>CB: final response (after retries, if any)
-    CB-->>P: records success or failure
+    CB-->>LB: records success or failure
+    LB-->>P: response tagged with the instance
     P->>P: filter the response headers
     P-->>MW: Response (buffered or streamed)
-    MW-->>C: 200 + X-Request-ID
+    MW-->>C: 200 + X-Request-ID + X-Gateway-Instance
 ```
 
 1. **Request id** (`api/middleware.py`). The incoming `X-Request-ID` is kept if it matches
@@ -116,24 +129,31 @@ sequenceDiagram
    carries it.
 2. **Routing** (`api/routes/proxy.py`). `/api/{service}/{path}` accepts `GET`, `POST`, `PUT`,
    `PATCH`, `DELETE`, `HEAD` and `OPTIONS`. `/api/{service}` alone reaches the root of the
-   service. `/health`, `/docs`, `/redoc` and `/openapi.json` are the gateway's own routes.
+   service, and `/api/{service}@{instance}/...` pins the request to one instance.
+   `/health`, `/docs`, `/redoc` and `/openapi.json` are the gateway's own routes.
 3. **Adapter** (`api/adapters.py`). The request becomes an `InboundRequest`, free of framework
    types. The request body is read whole here.
 4. **Service lookup** (`application/proxy_service.py`). The registry resolves the name. An
-   unknown one ends the request with `404 service_not_found`, without calling anything.
+   unknown service ends the request with `404 service_not_found`, and an unknown pinned
+   instance with `404 instance_not_found`, without calling anything.
 5. **Request headers** (`application/header_policy.py`): see [Headers](#headers).
-6. **Circuit breaker** (`infrastructure/resilience/circuit_breaker.py`). One per service. While
-   it is open, the request ends here with `503 service_unavailable`.
-7. **Retries** (`infrastructure/resilience/retry.py`). Idempotent methods only: see
-   [Retries](#retries).
-8. **HTTP call** (`infrastructure/httpx_client.py`). The URL is `base_url + "/" + path`, with the
-   path re-encoded and the query string passed through. Redirects are not followed: a `3xx`
-   reaches the client as it is. A timeout becomes `504` and any other network error `502`.
-9. **Response headers**: filtered again on the way back.
-10. **Response** (`api/adapters.py`). Buffered, or streamed for Server-Sent Events (see
+6. **Instance choice** (`infrastructure/resilience/load_balancer.py`). The next instance of the
+   service in turn, or the pinned one. See
+   [Several instances of a service](#several-instances-of-a-service).
+7. **Circuit breaker** (`infrastructure/resilience/circuit_breaker.py`). One per instance. An
+   instance whose circuit is open is skipped; when all of them are, the request ends with
+   `503 service_unavailable`.
+8. **Retries** (`infrastructure/resilience/retry.py`). Idempotent methods only, on the same
+   instance: see [Retries](#retries).
+9. **HTTP call** (`infrastructure/httpx_client.py`). The URL is the instance's
+   `base_url + "/" + path`, with the path re-encoded and the query string passed through.
+   Redirects are not followed: a `3xx` reaches the client as it is. A timeout becomes `504` and
+   any other network error `502`.
+10. **Response headers**: filtered again on the way back.
+11. **Response** (`api/adapters.py`). Buffered, or streamed for Server-Sent Events (see
     [Buffered and streamed responses](#buffered-and-streamed-responses)). Repeated headers
-    such as `Set-Cookie` are preserved.
-11. **Back to the client**. The middleware adds `X-Request-ID` to the response and logs one line:
+    such as `Set-Cookie` are preserved, and `X-Gateway-Instance` names the instance.
+12. **Back to the client**. The middleware adds `X-Request-ID` to the response and logs one line:
     `GET /api/mirag/api/v1/health -> 200 (12.3 ms)`.
 
 The status and body the service answers reach the client unchanged, and so do its headers
@@ -146,7 +166,7 @@ except the ones filtered above. Errors included: a `400` from the agent is still
 | Direction | Removed | Added |
 |---|---|---|
 | Client → service | Hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, and any header listed in `Connection`). `Host` and `Content-Length`, which httpx recomputes. The client's `X-Forwarded-*` and `X-Request-ID`, which the gateway rewrites so they cannot be spoofed. Any header with the name of a configured service header. | `X-Forwarded-For` (the incoming chain plus the client address), `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Request-ID`, and the service's configured `headers` (e.g. `X-Mirag-Token`). |
-| Service → client | Hop-by-hop headers. `Content-Encoding` and `Content-Length`: httpx already decompressed the body, so they no longer describe it. | `X-Request-ID`, and `X-Accel-Buffering: no` on streams so that a reverse proxy in front does not buffer them. |
+| Service → client | Hop-by-hop headers. `Content-Encoding` and `Content-Length`: httpx already decompressed the body, so they no longer describe it. A service's own `X-Gateway-Instance`, which the gateway overwrites. | `X-Request-ID`, `X-Gateway-Instance` (the instance that answered), and `X-Accel-Buffering: no` on streams so that a reverse proxy in front does not buffer them. |
 
 ### Buffered and streamed responses
 
@@ -169,8 +189,10 @@ except the ones filtered above. Errors included: a `400` from the agent is still
 - `max_attempts` counts every attempt (default 3). Between them the gateway waits
   `base_delay_seconds * 2^(attempt - 1)`, capped at `max_delay_seconds`: 0.1 s, then 0.2 s with
   the defaults.
-- When the attempts run out, the client receives the last result: the gateway's `502`/`504`,
-  or the service's own last response (e.g. its `503`).
+- Retries stay on the same instance. When they run out, a failed request can still move on to
+  another instance (see [Several instances of a service](#several-instances-of-a-service));
+  otherwise the client receives the last result: the gateway's `502`/`504`, or the service's
+  own last response (e.g. its `503`).
 - Every retry logs a warning: `Retrying GET http://... after status 503 (attempt 1/3, waiting 0.10s)`.
 
 ### Circuit breaker
@@ -185,16 +207,78 @@ stateDiagram-v2
     HalfOpen --> Open: the probe fails
 ```
 
+There is one circuit per **instance**: a server that fails does not take down the other
+services, nor the other servers of its own service.
+
 - **Closed**: requests flow. A *failure* is a connection error, a timeout, or a status in
   `failure_status_codes` (`502`, `503`, `504`). It is counted **after** the retries, so a
   whole sequence of failed attempts counts as one failure. Any other answer (`4xx` and `500`
   included) counts as a success and resets the count.
-- **Open**: every request to that service gets `503 service_unavailable` at once, without
-  calling it. The other services are not affected.
+- **Open**: the instance is not called. Its requests go to the other instances; when every
+  instance of the service is open, the client gets `503 service_unavailable` at once.
 - **Half-open**: once `recovery_timeout_seconds` pass, a single probe request goes through
-  (the rest keep getting `503` while it is in flight). Its outcome closes or reopens the
-  circuit.
-- Every change is logged: `Circuit for 'mirag' changed: closed -> open`.
+  (the rest keep skipping that instance while it is in flight). Its outcome closes or reopens
+  the circuit.
+- Every change is logged: `Circuit for 'mirag@3fa1c2d0' changed: closed -> open`.
+
+### Several instances of a service
+
+A service can run on several interchangeable servers, for example several agents started
+locally to generate development and test projects in parallel. List them in `base_urls`
+instead of `base_url`:
+
+```json
+{"name": "mirag", "base_urls": ["http://127.0.0.1:8100", "http://127.0.0.1:8101"]}
+```
+
+Each instance gets an **id** derived from its URL (`3fa1c2d0`): the same across restarts, and it
+does not reveal the internal address. The startup log maps ids to URLs:
+`Registered services: mirag (3fa1c2d0 http://127.0.0.1:8100, 9b2e4d11 http://127.0.0.1:8101)`.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant A as mirag instance A
+    participant B as mirag instance B
+
+    C->>G: POST /api/mirag/api/v1/chat
+    G->>A: turn of A
+    A--xG: connection refused (the request never arrived)
+    G->>B: the same request, to the next instance
+    B-->>G: 200 (event stream)
+    G-->>C: 200 + X-Gateway-Instance: B
+    C->>G: GET /api/mirag@B/api/v1/artifacts/{id}/download
+    G->>B: pinned: B and no other
+    B-->>G: ZIP
+    G-->>C: ZIP + X-Gateway-Instance: B
+```
+
+- **Spreading**: every request goes to the next instance in turn (round-robin), one rotation
+  per service.
+- **Failover**: when an instance cannot take a request, the request moves on to the next one,
+  trying each instance at most once. It moves on only when repeating it is safe:
+
+  | What happened on the instance | `GET` `HEAD` `OPTIONS` `PUT` `DELETE` | `POST` `PATCH` |
+  |---|---|---|
+  | Its circuit is open (it was not called) | Next instance | Next instance |
+  | The connection could not be opened (refused, connect timeout) | Next instance | Next instance: the instance never received it |
+  | It failed once it may have received the request (read timeout, reset) | Next instance | **Error to the client**: repeating it could run it twice |
+  | It answered, with any status | That answer | That answer |
+
+  When every instance fails, the client gets the error of the last one that was tried (`502`
+  or `504`), or `503` if none could be tried because all their circuits are open.
+- **Identifying the instance**: every proxied response carries `X-Gateway-Instance: <id>`.
+- **Pinning**: `/api/{service}@{id}/{path}` goes to that instance and no other: no rotation and
+  no failover. It is for state that only one instance has, such as the agent's generated
+  projects, which live in the memory of the instance that made them. If that instance is down
+  the answer is its error (`502`, `503`), because another instance would not have the data
+  anyway. An id that the service does not have is `404 instance_not_found`.
+- **Credentials**: the service's `headers` go to every instance, so all of them must accept the
+  same token.
+- **Worst case**: an idempotent request can go through its retries on each instance in turn, so
+  a service whose instances all hang can take `instances × max_attempts × timeout_seconds`
+  before the client gets its `504`.
 
 ### Errors
 
@@ -203,9 +287,10 @@ The gateway answers with its own error only when it could not get a response fro
 | Status | `code` | When | Retried | Counts for the breaker |
 |---|---|---|---|---|
 | `404` | `service_not_found` | No service is registered under that name. | No | No |
-| `502` | `bad_gateway` | The service could not be reached: connection refused, unknown host, reset. | Idempotent methods | Yes |
-| `503` | `service_unavailable` | The service's circuit is open. | No | No |
-| `504` | `gateway_timeout` | The service took longer than `timeout_seconds` to connect or to send data. | Idempotent methods | Yes |
+| `404` | `instance_not_found` | The request was pinned (`@`) to an instance the service does not have. | No | No |
+| `502` | `bad_gateway` | No instance could be reached: connection refused, unknown host, reset. | Idempotent methods | Yes |
+| `503` | `service_unavailable` | The circuit of every instance of the service is open. | No | No |
+| `504` | `gateway_timeout` | The instance took longer than `timeout_seconds` to connect or to send data. | Idempotent methods | Yes |
 | `500` | `internal_error` | A bug in the gateway. The details only go to the log. | No | No |
 
 ```json
@@ -226,22 +311,40 @@ sequenceDiagram
     participant B as mirag
 
     C->>G: GET /health/services
-    par every service at once
+    par every instance of every service at once
         G->>A: GET /status/200
     and
-        G->>B: GET /api/v1/health (+ X-Mirag-Token)
+        G->>B: GET /api/v1/health (+ X-Mirag-Token), on each mirag instance
     end
     G-->>C: 200 {"status": "ok" or "degraded", "services": [...]}
 ```
 
 - `/health` answers `200` without calling anything: it only says the gateway process is up.
   The Docker `HEALTHCHECK` uses it.
-- `/health/services` calls the `health_path` of every service in parallel, with the service's
-  configured headers. It skips retries and the circuit breaker, so it shows the real state
-  right now, and its failures never open a circuit.
-- A service is `up` when it answers `2xx`. The report is `ok` when all of them are up and
-  `degraded` otherwise, and it is always `200`: an outage downstream does not make the gateway
-  itself unhealthy.
+- `/health/services` calls the `health_path` of every instance of every service in parallel,
+  with the service's configured headers. It skips the load balancer, retries and the circuit
+  breaker, so it shows the real state of each server right now, and its failures never open a
+  circuit.
+- An instance is `up` when it answers `2xx`. A service is `up` when all its instances are,
+  `down` when none is, and `degraded` in between. The report is `ok` when every service is up
+  and `degraded` otherwise, and it is always `200`: an outage downstream does not make the
+  gateway itself unhealthy.
+
+```json
+{
+  "status": "degraded",
+  "services": [
+    {
+      "name": "mirag",
+      "status": "degraded",
+      "instances": [
+        {"id": "3fa1c2d0", "status": "up", "latency_ms": 8.02, "detail": null},
+        {"id": "9b2e4d11", "status": "down", "latency_ms": null, "detail": "Service 'mirag' is unreachable"}
+      ]
+    }
+  ]
+}
+```
 
 ## Getting started
 
@@ -291,8 +394,11 @@ only shows up when a service named `mirag` is registered.
 |---|---|---|---|
 | `GET` | `/health` | Liveness of the gateway. Calls nothing. | `200 {"status": "ok"}` |
 | `GET` | `/health/services` | Health of every registered service. | `200` with `ok` or `degraded` |
-| `GET` `POST` `PUT` `PATCH` `DELETE` `HEAD` `OPTIONS` | `/api/{service}/{path}` | Forwarded to `{base_url}/{path}`. | Whatever the service answers, or `404`/`502`/`503`/`504` from the gateway |
+| `GET` `POST` `PUT` `PATCH` `DELETE` `HEAD` `OPTIONS` | `/api/{service}/{path}` | Forwarded to `{base_url}/{path}` of the next instance. | Whatever the service answers, or `404`/`502`/`503`/`504` from the gateway |
+| same | `/api/{service}@{instance}/{path}` | The same, pinned to one instance. | Same, or `404 instance_not_found` |
 | same | `/api/{service}` | Forwarded to the root of the service. | Same |
+
+Every proxied response carries `X-Gateway-Instance`, the id of the instance that answered.
 | `GET` | `/docs`, `/redoc`, `/openapi.json` | The documentation. | `200` |
 
 In Swagger, the `path` parameter of the proxy may contain `/` (`anything/1`). Swagger sends it
@@ -336,8 +442,9 @@ curl -N -X POST http://localhost:8000/api/mirag/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"question": "What is a PostgreSQL index?", "locale": "en"}'
 
-# The ZIP: take the path from project.download_url in the "done" event.
-curl -OJ http://localhost:8000/api/mirag/api/v1/artifacts/<id>/download
+# The ZIP: take the path from project.download_url in the "done" event, and the instance from
+# the X-Gateway-Instance header of the chat response (curl -i shows it).
+curl -OJ "http://localhost:8000/api/mirag@<instance>/api/v1/artifacts/<id>/download"
 ```
 
 Swagger's *Try it out* works for the chat too, but it shows the stream only when it ends.
@@ -375,6 +482,10 @@ Each entry in `GATEWAY_SERVICES` accepts:
 ```
 
 - `name` is the gateway URL segment (`/api/users/...`): lowercase letters, digits, `-` and `_`.
+- `base_url` is the server of the service. For a service running on several servers, give
+  `base_urls` instead, a list: `"base_urls": ["http://users-1:8001", "http://users-2:8001"]`.
+  Exactly one of the two, and no server twice. See
+  [Several instances of a service](#several-instances-of-a-service).
 - `timeout_seconds` applies to each wait for data (connecting, or the next chunk of the body),
   not to the whole response, so a long event stream is fine as long as events keep arriving.
 - `headers` (optional) are sent on every request to the service, health checks included, and
@@ -412,9 +523,11 @@ Browser ──► gateway /api/mirag/api/v1/chat ──(+ X-Mirag-Token)──�
   `MIRAG_OFFLINE=1` in its `.env` to rehearse without spending anything).
 - **Token**: `MIRAG_TOKEN` must hold the same value in both `.env` files. The gateway injects it
   as `X-Mirag-Token`; the browser neither needs it nor can see it.
-- **URLs**: every agent path maps to the gateway by adding the `/api/mirag` prefix. That includes
-  `project.download_url` from the chat's `done` event: download from
-  `"/api/mirag" + download_url`, and do it as soon as `done` arrives (artifacts expire).
+- **URLs**: every agent path maps to the gateway by adding the `/api/mirag` prefix. The one
+  exception is `project.download_url` from the chat's `done` event: the ZIP only exists in the
+  instance that ran the chat, so download from
+  `"/api/mirag@" + <X-Gateway-Instance of the chat> + download_url`, and do it as soon as `done`
+  arrives (artifacts expire). That form also works with a single instance.
 - **Chat stream**: `POST /api/mirag/api/v1/chat` answers with Server-Sent Events, relayed as they
   arrive. The agent always ends with a `done` event. A stream that ends without one was
   interrupted: the gateway logs `Stream from 'mirag' ended early`.
@@ -423,6 +536,26 @@ Browser ──► gateway /api/mirag/api/v1/chat ──(+ X-Mirag-Token)──�
 
 To run both without Docker: start the agent with `MIRAG_PORT=8100 mirag serve` (it also defaults to
 port 8000) and use the `GATEWAY_SERVICES` line from `.env.example`.
+
+### Several agents at once
+
+To generate several development and test projects in parallel, start one agent per port, all
+with the same `MIRAG_TOKEN`, and list them in `base_urls`:
+
+```bash
+# One terminal per agent (in the agent's folder). MIRAG_OFFLINE=1 rehearses without spending.
+MIRAG_PORT=8100 MIRAG_TOKEN=<token> mirag serve
+MIRAG_PORT=8101 MIRAG_TOKEN=<token> mirag serve
+MIRAG_PORT=8102 MIRAG_TOKEN=<token> mirag serve
+```
+
+```bash
+GATEWAY_SERVICES='[{"name": "mirag", "base_urls": ["http://127.0.0.1:8100", "http://127.0.0.1:8101", "http://127.0.0.1:8102"], "timeout_seconds": 180, "health_path": "/api/v1/health", "headers": {"X-Mirag-Token": "<token>"}}]'
+```
+
+Each chat goes to the next agent in turn, and a stopped agent is skipped: its chats go to the
+others. `/health/services` shows each agent on its own. Each agent keeps its generated projects
+to itself, which is why the download is pinned to the instance that ran the chat.
 
 ### The flow of a session
 
@@ -441,15 +574,16 @@ sequenceDiagram
     A-->>G: JSON
     G-->>B: JSON
     B->>G: POST /api/mirag/api/v1/chat {"question": "..."}
-    G->>A: POST /api/v1/chat
+    G->>A: POST /api/v1/chat (the next instance in turn)
+    Note over B,G: response headers: X-Gateway-Instance = {instance}
     loop while the agent works
         A-->>G: data: {"type": "step", ...}
         G-->>B: data: {"type": "step", ...}
     end
     A-->>G: data: {"type": "done", "project": {"download_url": "/api/v1/artifacts/{id}/download"}}
     G-->>B: the same "done" event
-    B->>G: GET /api/mirag/api/v1/artifacts/{id}/download
-    G->>A: GET /api/v1/artifacts/{id}/download
+    B->>G: GET /api/mirag@{instance}/api/v1/artifacts/{id}/download
+    G->>A: GET /api/v1/artifacts/{id}/download (that same instance)
     A-->>G: ZIP + X-Mirag-Sha256
     G-->>B: ZIP + X-Mirag-Sha256
 ```
@@ -460,10 +594,12 @@ sequenceDiagram
    mode.
 2. **Ask**: `POST /api/mirag/api/v1/chat` with `{"question", "locale", "mode"}`. A bad body is a
    JSON `400` *before* the stream starts. After that the status is `200` and events arrive one
-   by one: `step` events show progress, and `done` carries the answer.
+   by one: `step` events show progress, and `done` carries the answer. Keep the response's
+   `X-Gateway-Instance` header.
 3. **Download**: when `done.project.download_url` is not `null`, download it right away from
-   `"/api/mirag" + download_url` (artifacts expire) and compare `X-Mirag-Sha256` with
-   `project.zip.sha256`.
+   `"/api/mirag@" + instance + download_url` (artifacts expire, and only that instance has it)
+   and compare `X-Mirag-Sha256` with `project.zip.sha256`. Without the pin, the download can
+   land on another agent and get `410 gone`.
 4. **Interruptions**: a stream that ends without `done` was cut (the agent or the connection
    failed). The gateway never retries the `POST`: show the error and let the user ask again.
 
@@ -478,6 +614,7 @@ const response = await fetch("/api/mirag/api/v1/chat", {
   body: JSON.stringify({ question, locale: "es" }),
 });
 if (!response.ok) throw await response.json(); // 400/401/5xx arrive as JSON, before any event
+const instance = response.headers.get("X-Gateway-Instance"); // the agent that has the project
 
 const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
 let buffer = "";
@@ -496,6 +633,11 @@ for (;;) {
   }
 }
 if (final === null) throw new Error("The answer was interrupted");
+
+if (final.project?.download_url) {
+  // Pinned to the agent that generated it: a plain <a href> to this URL works too.
+  const zip = await fetch(`/api/mirag@${instance}${final.project.download_url}`);
+}
 ```
 
 ## Extending the gateway
@@ -519,8 +661,13 @@ if (final === null) throw new Error("The answer was interrupted");
   rate limit, and cap the model key's credit in the provider's dashboard.
 - The access log line of a streamed response measures the time until its headers were sent, not
   until the stream ended.
-- Circuit breaker state lives in each process's memory: with several replicas, each one keeps
-  its own count.
+- Circuit breaker state and the round-robin turn live in each process's memory: with several
+  replicas of the gateway, each one keeps its own.
+- Round-robin counts requests, not load: a chat that streams for minutes and a quick `GET`
+  weigh the same, so one agent can end up with several long chats while another is idle.
+- The instances of a service are fixed at startup: adding or removing an agent means editing
+  `GATEWAY_SERVICES` and restarting the gateway. Discovering them at runtime is a new
+  `ServiceRegistry` (see [Extending the gateway](#extending-the-gateway)).
 - There is no CORS: a browser can only call the gateway from the same origin (for example,
   with the page and the gateway behind the same reverse proxy). Serving the page from another
   origin needs FastAPI's `CORSMiddleware` in `api/app.py`.

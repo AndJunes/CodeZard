@@ -86,7 +86,8 @@ class CircuitBreaker:
 
 
 class CircuitBreakerUpstreamClient(UpstreamClient):
-    """Keeps one ``CircuitBreaker`` per service so a failing service cannot drag down the rest."""
+    """Keeps one ``CircuitBreaker`` per service instance, so a failing server cannot drag down
+    the rest: neither other services nor the other instances of the same one."""
 
     def __init__(
         self,
@@ -99,21 +100,22 @@ class CircuitBreakerUpstreamClient(UpstreamClient):
         self._failure_status_codes = failure_status_codes
         self._breakers: dict[str, CircuitBreaker] = {}
 
-    def state_of(self, service_name: str) -> CircuitState:
-        return self._breaker_for(service_name).state
+    def state_of(self, target: str) -> CircuitState:
+        """``target`` is ``service@instance``, or the service name for an unbalanced request."""
+        return self._breaker_for(target).state
 
     async def send(self, request: OutboundRequest) -> UpstreamResponse:
-        service_name = request.service.name
-        breaker = self._breaker_for(service_name)
+        target = request.target
+        breaker = self._breaker_for(target)
         if not breaker.try_acquire():
-            raise CircuitOpenError(service_name)
+            raise CircuitOpenError(request.service.name)
 
         previous_state = breaker.state
         try:
             response = await self._inner.send(request)
         except UpstreamError:
             breaker.on_failure()
-            self._log_transition(service_name, previous_state, breaker.state)
+            self._log_transition(target, previous_state, breaker.state)
             raise
         except BaseException:
             breaker.on_abort()
@@ -123,15 +125,15 @@ class CircuitBreakerUpstreamClient(UpstreamClient):
             breaker.on_failure()
         else:
             breaker.on_success()
-        self._log_transition(service_name, previous_state, breaker.state)
+        self._log_transition(target, previous_state, breaker.state)
         return response
 
-    def _breaker_for(self, service_name: str) -> CircuitBreaker:
-        if service_name not in self._breakers:
-            self._breakers[service_name] = self._breaker_factory()
-        return self._breakers[service_name]
+    def _breaker_for(self, target: str) -> CircuitBreaker:
+        if target not in self._breakers:
+            self._breakers[target] = self._breaker_factory()
+        return self._breakers[target]
 
     @staticmethod
-    def _log_transition(service_name: str, before: CircuitState, after: CircuitState) -> None:
+    def _log_transition(target: str, before: CircuitState, after: CircuitState) -> None:
         if before is not after:
-            logger.warning("Circuit for '%s' changed: %s -> %s", service_name, before, after)
+            logger.warning("Circuit for '%s' changed: %s -> %s", target, before, after)

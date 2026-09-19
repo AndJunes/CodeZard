@@ -11,6 +11,13 @@ class ServiceNotFoundError(GatewayError):
         self.service_name = service_name
 
 
+class InstanceNotFoundError(GatewayError):
+    def __init__(self, service_name: str, instance_id: str) -> None:
+        super().__init__(f"Service '{service_name}' has no instance '{instance_id}'")
+        self.service_name = service_name
+        self.instance_id = instance_id
+
+
 class DuplicateServiceError(GatewayError):
     def __init__(self, service_name: str) -> None:
         super().__init__(f"Service '{service_name}' is registered more than once")
@@ -20,19 +27,28 @@ class DuplicateServiceError(GatewayError):
 class UpstreamError(GatewayError):
     """The downstream service could not produce a response."""
 
-    def __init__(self, service_name: str, message: str) -> None:
+    def __init__(self, service_name: str, message: str, *, request_sent: bool = True) -> None:
         super().__init__(message)
         self.service_name = service_name
+        self.request_sent = request_sent
+        """``False`` when the connection was never established: the service cannot have acted
+        on the request, so sending it elsewhere is safe even for a ``POST``."""
 
 
 class UpstreamTimeoutError(UpstreamError):
-    def __init__(self, service_name: str) -> None:
-        super().__init__(service_name, f"Service '{service_name}' did not respond in time")
+    def __init__(self, service_name: str, *, request_sent: bool = True) -> None:
+        super().__init__(
+            service_name,
+            f"Service '{service_name}' did not respond in time",
+            request_sent=request_sent,
+        )
 
 
 class UpstreamConnectionError(UpstreamError):
-    def __init__(self, service_name: str) -> None:
-        super().__init__(service_name, f"Service '{service_name}' is unreachable")
+    def __init__(self, service_name: str, *, request_sent: bool = True) -> None:
+        super().__init__(
+            service_name, f"Service '{service_name}' is unreachable", request_sent=request_sent
+        )
 
 
 class CircuitOpenError(GatewayError):

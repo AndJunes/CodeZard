@@ -11,6 +11,9 @@ from gateway.domain.ports import UpstreamClient
 # back until the service closes the stream.
 _STREAMED_MEDIA_TYPES = frozenset({"text/event-stream"})
 
+# Raised before a single byte of the request left: no connection, or none free in the pool.
+_NOT_SENT_TIMEOUTS = (httpx.ConnectTimeout, httpx.PoolTimeout)
+
 
 class HttpxUpstreamClient(UpstreamClient):
     """Sends requests over a shared ``httpx.AsyncClient`` (pooled connections)."""
@@ -72,9 +75,14 @@ def _translated_errors(service_name: str) -> Iterator[None]:
     """Turn httpx failures into domain errors so callers never depend on httpx."""
     try:
         yield
-    # TimeoutException subclasses TransportError, so it must be caught first.
+    # Subclasses first: the connect and pool timeouts are TimeoutExceptions, and every
+    # TimeoutException is a TransportError.
+    except _NOT_SENT_TIMEOUTS as exc:
+        raise UpstreamTimeoutError(service_name, request_sent=False) from exc
     except httpx.TimeoutException as exc:
         raise UpstreamTimeoutError(service_name) from exc
+    except httpx.ConnectError as exc:
+        raise UpstreamConnectionError(service_name, request_sent=False) from exc
     except httpx.TransportError as exc:
         raise UpstreamConnectionError(service_name) from exc
 

@@ -11,6 +11,9 @@ from gateway.application.proxy_service import ProxyService
 
 PROXIED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
+# `/api/{service}@{instance}/...` pins a request to one instance. Service names cannot hold it.
+INSTANCE_SEPARATOR = "@"
+
 # Proxied like the rest, but kept out of Swagger: they would add entries and no information.
 _UNDOCUMENTED_METHODS = frozenset({"HEAD", "OPTIONS"})
 _METHODS_WITH_BODY = frozenset({"POST", "PUT", "PATCH"})
@@ -22,6 +25,11 @@ and headers, minus the hop-by-hop ones. The gateway adds `X-Forwarded-For`, `X-F
 any client header of the same name.
 
 `/api/{service_name}` alone (no trailing path) reaches the root of the service.
+
+A service with several instances gets its requests spread among them, and a request moves on
+to the next instance when the current one cannot take it. The `X-Gateway-Instance` response
+header names the instance that answered; `{service_name}@{instance}` sends a request to that
+instance and no other, e.g. to download something it keeps in memory.
 """
 
 _ANY_BODY = {
@@ -33,13 +41,26 @@ _ANY_BODY = {
 }
 
 _RESPONSES: dict[int | str, JsonObject] = {
+    "200": {
+        "description": "The service's response, relayed unchanged.",
+        "headers": {
+            "X-Gateway-Instance": {
+                "description": "The instance that answered.",
+                "schema": {"type": "string", "example": "3fa1c2d0"},
+            }
+        },
+    },
     **gateway_error_responses(404, 502, 503, 504),
     "default": {"description": "Any other status the service answers, relayed unchanged."},
 }
 
 ServiceName = Annotated[
     str,
-    Path(description="A service registered in `GATEWAY_SERVICES`.", examples=["httpbin"]),
+    Path(
+        description="A service registered in `GATEWAY_SERVICES`, optionally pinned to one of "
+        "its instances: `name@instance`.",
+        examples=["httpbin"],
+    ),
 ]
 ServicePath = Annotated[
     str,
@@ -65,7 +86,6 @@ for _method in PROXIED_METHODS:
         operation_id=f"proxy_{_method.lower()}",
         summary=f"Forward a {_method} request to a service",
         description=_DESCRIPTION,
-        response_description="The service's response, relayed unchanged.",
         responses=_RESPONSES,
         openapi_extra=_ANY_BODY if _method in _METHODS_WITH_BODY else None,
         include_in_schema=_method not in _UNDOCUMENTED_METHODS,
@@ -78,6 +98,7 @@ async def proxy_root(service_name: str, request: Request, proxy: ProxyServiceDep
 
 
 async def _forward(proxy: ProxyService, service_name: str, path: str, request: Request) -> Response:
+    name, pinned, instance_id = service_name.partition(INSTANCE_SEPARATOR)
     inbound = await to_inbound_request(request, path)
-    upstream = await proxy.forward(service_name, inbound)
+    upstream = await proxy.forward(name, inbound, instance_id if pinned else None)
     return to_response(upstream)

@@ -180,9 +180,14 @@ _SSE_EXAMPLE = (
 )
 
 _DOWNLOAD_DESCRIPTION = """\
-The verified ZIP of a generated project. Take the URL from `project.download_url` in the
-`done` event, prefixed with `/api/mirag`; never build it. Artifacts live in the agent's memory
-and expire (one hour, a cap of 20, every restart): download as soon as `done` arrives.
+The verified ZIP of a generated project. Take the path from `project.download_url` in the
+`done` event; never build it. Artifacts live in the memory of the agent instance that made
+them and expire (one hour, a cap of 20, every restart): download as soon as `done` arrives.
+
+**With several agent instances only the one that ran the chat has the ZIP**, so pin the
+download to it: `/api/mirag@{instance}` + `download_url`, where `instance` is the
+`X-Gateway-Instance` header of the chat response. That form works with a single instance
+too. Without the pin, the download lands on any instance and may get `410 gone`.
 """
 
 MIRAG = DownstreamContract(
@@ -259,6 +264,13 @@ MIRAG = DownstreamContract(
                 "responses": {
                     "200": {
                         "description": "The event stream.",
+                        "headers": {
+                            "X-Gateway-Instance": {
+                                "description": "The agent instance answering. Keep it to "
+                                "download the project from that same instance.",
+                                "schema": {"type": "string", "example": "3fa1c2d0"},
+                            }
+                        },
                         "content": {
                             "text/event-stream": {
                                 "schema": {"type": "string"},

@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 from typing import Any
 
 import pytest
@@ -196,6 +197,26 @@ class TestCircuitBreakerUpstreamClient:
         assert response is OK
         assert client.state_of("users") is CircuitState.OPEN
         assert client.state_of("orders") is CircuitState.CLOSED
+
+    async def test_breakers_are_isolated_per_instance(self, clock: FakeClock) -> None:
+        agent = ServiceDefinition(name="agent", base_urls=("http://a", "http://b"))
+        on_a, on_b = (
+            dataclasses.replace(make_request(agent), instance=instance)
+            for instance in agent.instances
+        )
+        inner = ScriptedUpstreamClient(
+            UpstreamConnectionError("agent"), UpstreamConnectionError("agent"), OK
+        )
+        client = breaker_client(inner, clock)
+        for _ in range(2):
+            with pytest.raises(UpstreamConnectionError):
+                await client.send(on_a)
+
+        response = await client.send(on_b)
+
+        assert response is OK
+        assert client.state_of(on_a.target) is CircuitState.OPEN
+        assert client.state_of(on_b.target) is CircuitState.CLOSED
 
     async def test_recovers_once_the_service_is_back(
         self, users_service: ServiceDefinition, clock: FakeClock

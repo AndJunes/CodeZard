@@ -9,6 +9,7 @@ from gateway.api.schemas import ErrorDetail, ErrorResponse
 from gateway.domain.exceptions import (
     CircuitOpenError,
     GatewayError,
+    InstanceNotFoundError,
     ServiceNotFoundError,
     UpstreamConnectionError,
     UpstreamTimeoutError,
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 # New error types only need an entry here (lookup follows the class hierarchy).
 _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     ServiceNotFoundError: (status.HTTP_404_NOT_FOUND, "service_not_found"),
+    InstanceNotFoundError: (status.HTTP_404_NOT_FOUND, "instance_not_found"),
     UpstreamConnectionError: (status.HTTP_502_BAD_GATEWAY, "bad_gateway"),
     CircuitOpenError: (status.HTTP_503_SERVICE_UNAVAILABLE, "service_unavailable"),
     UpstreamTimeoutError: (status.HTTP_504_GATEWAY_TIMEOUT, "gateway_timeout"),

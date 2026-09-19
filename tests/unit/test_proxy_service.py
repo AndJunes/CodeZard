@@ -63,7 +63,7 @@ async def test_returns_the_upstream_response_with_filtered_headers(
 
 async def test_sends_the_service_headers_instead_of_the_client_ones() -> None:
     service = ServiceDefinition(
-        name="agent", base_url="http://agent.internal", headers=(("x-token", "secret"),)
+        name="agent", base_urls=("http://agent.internal",), headers=(("x-token", "secret"),)
     )
     client = ScriptedUpstreamClient(UpstreamResponse(status_code=200))
     inbound = InboundRequest(method="POST", path="/chat", headers=(("x-token", "forged"),))

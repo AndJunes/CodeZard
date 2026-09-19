@@ -33,8 +33,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         async with http_client_factory(settings) as http_client:
             app.state.container = build_container(settings, http_client)
-            names = ", ".join(service.name for service in settings.services) or "none"
-            logger.info("Gateway ready. Registered services: %s", names)
+            logger.info("Gateway ready. Registered services: %s", _describe_services(settings))
             yield
 
     app = FastAPI(
@@ -50,3 +49,13 @@ def create_app(
     app.include_router(proxy.router)
     install_openapi(app, (service.name for service in settings.services), CONTRACTS)
     return app
+
+
+def _describe_services(settings: Settings) -> str:
+    """E.g. ``mirag (3fa1c2d0 http://mirag-1:8000, 9b2e4d11 http://mirag-2:8000)``: the log is
+    where an instance id seen by a client can be matched to its server."""
+    described = [
+        f"{service.name} ({', '.join(f'{i.id} {i.base_url}' for i in service.instances)})"
+        for service in settings.service_definitions()
+    ]
+    return ", ".join(described) or "none"

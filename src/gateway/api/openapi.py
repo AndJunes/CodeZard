@@ -19,6 +19,7 @@ from gateway.api.schemas import ErrorDetail, ErrorResponse
 from gateway.domain.exceptions import (
     CircuitOpenError,
     GatewayError,
+    InstanceNotFoundError,
     ServiceNotFoundError,
     UpstreamConnectionError,
     UpstreamTimeoutError,
@@ -35,8 +36,11 @@ forwarded to `{service base_url}/{path}`, and the service's answer comes back un
 - **Errors**: the ones produced by the gateway always have the `ErrorResponse` shape. The ones
   produced by a service are relayed exactly as the service wrote them.
 - **Resilience**: `GET`, `HEAD`, `OPTIONS`, `PUT` and `DELETE` are retried on connection errors,
-  timeouts and `502`/`503`/`504`; `POST` and `PATCH` never are. A service that keeps failing
-  gets its circuit opened, and the gateway answers `503` at once without calling it.
+  timeouts and `502`/`503`/`504`; `POST` and `PATCH` never are. A server that keeps failing
+  gets its circuit opened, and the gateway stops calling it for a while.
+- **Several instances**: a service can run on several servers. Requests are spread among them,
+  one that cannot take a request hands it to the next, and `X-Gateway-Instance` names the one
+  that answered. `/api/{service}@{instance}/...` goes back to that same server.
 - **Server-Sent Events** (`text/event-stream`) are relayed event by event. Swagger UI shows
   them only when the stream ends: use `curl -N` to watch them arrive.
 """
@@ -57,13 +61,17 @@ _EXAMPLE_REQUEST_ID = "5f0c6b0e7d2a4c1e9b3f8a6d4e2c1b0a"
 _GATEWAY_ERRORS: tuple[tuple[GatewayError, str], ...] = (
     (ServiceNotFoundError("billing"), "no service is registered under that name."),
     (
+        InstanceNotFoundError("mirag", "0badc0de"),
+        "the service has no instance with that id (the request was pinned with `@`).",
+    ),
+    (
         UpstreamConnectionError("users"),
         "the service could not be reached: connection refused, unknown host or reset.",
     ),
     (
         CircuitOpenError("users"),
-        "the service failed repeatedly and its circuit is open: the gateway answers at once, "
-        "without calling it, until the recovery timeout passes.",
+        "every instance of the service failed repeatedly and has its circuit open: the gateway "
+        "answers at once, without calling them, until the recovery timeout passes.",
     ),
     (
         UpstreamTimeoutError("users"),
@@ -78,7 +86,10 @@ def schema_ref(model: type[BaseModel]) -> JsonObject:
 
 
 def gateway_error_responses(*status_codes: int) -> dict[int | str, JsonObject]:
-    """OpenAPI responses for the errors the gateway itself answers, limited to ``status_codes``."""
+    """OpenAPI responses for the errors the gateway itself answers, limited to ``status_codes``.
+
+    Errors sharing a status share its response, with one named example per error code.
+    """
     responses: dict[int | str, JsonObject] = {}
     for error, description in _GATEWAY_ERRORS:
         status_code, code = classify(error)
@@ -87,15 +98,19 @@ def gateway_error_responses(*status_codes: int) -> dict[int | str, JsonObject]:
         example = ErrorResponse(
             error=ErrorDetail(code=code, message=str(error), request_id=_EXAMPLE_REQUEST_ID)
         )
-        responses[str(status_code)] = {
-            "description": f"`{code}`: {description}",
-            "content": {
-                "application/json": {
-                    "schema": schema_ref(ErrorResponse),
-                    "example": example.model_dump(),
-                }
+        response = responses.setdefault(
+            str(status_code),
+            {
+                "description": "",
+                "content": {
+                    "application/json": {"schema": schema_ref(ErrorResponse), "examples": {}}
+                },
             },
-        }
+        )
+        response["description"] = "\n\n".join(
+            filter(None, [response["description"], f"`{code}`: {description}"])
+        )
+        response["content"]["application/json"]["examples"][code] = {"value": example.model_dump()}
     return responses
 
 

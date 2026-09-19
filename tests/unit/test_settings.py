@@ -25,8 +25,8 @@ def test_loads_services_and_nested_settings_from_environment(
     settings = Settings(_env_file=None)
 
     assert settings.service_definitions() == [
-        ServiceDefinition(name="users", base_url="http://users:8001", timeout_seconds=3.0),
-        ServiceDefinition(name="orders", base_url="http://orders:8002/v1", health_path="/ping"),
+        ServiceDefinition(name="users", base_urls=("http://users:8001",), timeout_seconds=3.0),
+        ServiceDefinition(name="orders", base_urls=("http://orders:8002/v1",), health_path="/ping"),
     ]
     assert settings.retry.max_attempts == 5
     assert settings.circuit_breaker.failure_threshold == 7
@@ -42,7 +42,8 @@ def test_defaults_are_production_safe(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.circuit_breaker.failure_status_codes == {502, 503, 504}
 
 
-@pytest.mark.parametrize("name", ["Users", "-users", "us ers", "users/admin", ""])
+# "@" in particular: it separates the service from a pinned instance in gateway paths.
+@pytest.mark.parametrize("name", ["Users", "-users", "us ers", "users/admin", "mir@g", ""])
 def test_rejects_invalid_service_names(name: str) -> None:
     with pytest.raises(ValidationError):
         ServiceSettings(name=name, base_url="http://users:8001")
@@ -52,6 +53,36 @@ def test_rejects_invalid_service_names(name: str) -> None:
 def test_rejects_invalid_base_urls(base_url: str) -> None:
     with pytest.raises(ValidationError):
         ServiceSettings(name="users", base_url=base_url)
+    with pytest.raises(ValidationError):
+        ServiceSettings(name="users", base_urls=["http://users:8001", base_url])
+
+
+def test_loads_a_service_with_several_instances() -> None:
+    service = ServiceSettings(
+        name="mirag", base_urls=["http://127.0.0.1:8100/", "http://127.0.0.1:8101"]
+    ).to_definition()
+
+    assert service.base_urls == ("http://127.0.0.1:8100", "http://127.0.0.1:8101")
+    assert len({instance.id for instance in service.instances}) == 2
+
+
+@pytest.mark.parametrize(
+    "servers",
+    [
+        {},
+        {"base_url": "http://a:1", "base_urls": ["http://b:2"]},
+        {"base_urls": []},
+    ],
+)
+def test_needs_exactly_one_way_of_giving_the_servers(servers: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="exactly one of 'base_url' and 'base_urls'"):
+        ServiceSettings.model_validate({"name": "mirag", **servers})
+
+
+def test_rejects_the_same_server_twice() -> None:
+    # The trailing slash does not make it another server.
+    with pytest.raises(ValidationError, match="same server twice"):
+        ServiceSettings(name="mirag", base_urls=["http://a:1", "http://a:1/"])
 
 
 def test_service_headers_are_loaded_but_never_shown(monkeypatch: pytest.MonkeyPatch) -> None:

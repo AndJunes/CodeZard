@@ -63,11 +63,12 @@ async def test_documents_a_request_body_only_for_methods_that_carry_one(
 
 async def test_documents_the_errors_the_proxy_really_answers(client: httpx.AsyncClient) -> None:
     responses = (await client.get("/openapi.json")).json()["paths"][PROXY_PATH]["get"]["responses"]
-    documented = responses["404"]["content"]["application/json"]["example"]["error"]["code"]
+    documented = set(responses["404"]["content"]["application/json"]["examples"])
 
-    actual = (await client.get("/api/billing/anything")).json()["error"]["code"]
+    unknown_service = (await client.get("/api/billing/anything")).json()["error"]["code"]
+    unknown_instance = (await client.get("/api/users@0badc0de/x")).json()["error"]["code"]
 
-    assert documented == actual
+    assert documented == {unknown_service, unknown_instance}
     assert {"502", "503", "504"} <= set(responses)
     # The path parameters cannot fail validation, so FastAPI's default 422 would be a lie.
     assert "422" not in responses

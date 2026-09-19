@@ -98,12 +98,13 @@ async def test_applies_the_service_timeout(
 
 
 @pytest.mark.parametrize(
-    ("error", "expected"),
+    ("error", "expected", "request_sent"),
     [
-        (httpx.ConnectTimeout("timed out"), UpstreamTimeoutError),
-        (httpx.ReadTimeout("timed out"), UpstreamTimeoutError),
-        (httpx.ConnectError("refused"), UpstreamConnectionError),
-        (httpx.RemoteProtocolError("bad response"), UpstreamConnectionError),
+        (httpx.ConnectTimeout("timed out"), UpstreamTimeoutError, False),
+        (httpx.PoolTimeout("no free connection"), UpstreamTimeoutError, False),
+        (httpx.ReadTimeout("timed out"), UpstreamTimeoutError, True),
+        (httpx.ConnectError("refused"), UpstreamConnectionError, False),
+        (httpx.RemoteProtocolError("bad response"), UpstreamConnectionError, True),
     ],
 )
 async def test_translates_transport_errors_into_domain_errors(
@@ -111,6 +112,7 @@ async def test_translates_transport_errors_into_domain_errors(
     make_client: Callable[[Handler], HttpxUpstreamClient],
     error: httpx.TransportError,
     expected: type[UpstreamError],
+    request_sent: bool,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise error
@@ -122,6 +124,8 @@ async def test_translates_transport_errors_into_domain_errors(
 
     assert exc_info.value.service_name == "users"
     assert exc_info.value.__cause__ is error
+    # Whether the service may have received it: another instance can take it only if not.
+    assert exc_info.value.request_sent is request_sent
 
 
 async def test_buffers_regular_bodies_and_releases_the_connection(
