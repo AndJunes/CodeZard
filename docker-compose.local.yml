@@ -51,7 +51,13 @@ services:
       MIRAG_EXECUTION: "off"       # generates code and tests, does not run them. That is QA's.
       MIRAG_MODEL: "${MIRAG_BACKEND_MODEL:-inclusionai/ling-3.0-flash-vl:free}"
       MIRAG_BUDGET_USD: "${MIRAG_BUDGET_USD:-0.10}"
-      MIRAG_MAX_OUTPUT_TOKENS: "16000"
+      # 32,000 and not 16,000, which is the model's ceiling rather than half of it.
+      #
+      # Reasoning tokens come out of this budget. At 16,000 the fourth batch of a 31-file
+      # `core` group came back with `finish_reason: length` and an EMPTY message three times
+      # running: the whole allowance spent thinking, nothing written. The generation stopped
+      # there and the project shipped with no README, because `docs` was never asked.
+      MIRAG_MAX_OUTPUT_TOKENS: "${MIRAG_MAX_OUTPUT_TOKENS:-32000}"
       MIRAG_TOKEN: "${MIRAG_TOKEN:?MIRAG_TOKEN is missing}"
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is missing}"
     networks: [interna]
