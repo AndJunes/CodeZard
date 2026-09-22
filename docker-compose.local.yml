@@ -3,9 +3,10 @@
 #   cp .env.local.example .env.local && nano .env.local     # the PM needs a real key
 #   docker compose -f docker-compose.local.yml --env-file .env.local up -d --build
 #
-# Then run the front end on this machine against http://127.0.0.1:8090 — it is not in here on
-# purpose. Fewer moving parts, and rebuilding an Astro island is a second rather than an image
-# build.
+# Then run the front end on this machine with GATEWAY_URL=http://127.0.0.1:8090 — it is not in
+# here on purpose. Fewer moving parts, and rebuilding an Astro island is a second rather than
+# an image build. That one variable is now its ENTIRE configuration: the tokens, the service
+# names and the locale moved to the gateway along with the decisions that needed them.
 #
 # This file exists because the only configuration that ever wired these together lived in
 # /tmp. That is fine for an afternoon and useless the next morning: the correct `health_path`,
@@ -101,6 +102,17 @@ services:
           "read_timeout_seconds":600,"health_path":"/api/v1/health"},
          {"name":"pm","base_url":"http://mirag-pm:8000","timeout_seconds":10,
           "read_timeout_seconds":600,"health_path":"/api/v1/health"}]
+
+      # The gateway RUNS the flow now; it does not just forward it. That is why both tokens
+      # are here rather than in the front end's environment: the thing that decides is the
+      # thing that has to authenticate. The front end holds GATEWAY_URL and nothing else.
+      GATEWAY_ORCHESTRATION__ENABLED: "true"
+      GATEWAY_ORCHESTRATION__PM_TOKEN: "${MIRAG_PM_TOKEN:?MIRAG_PM_TOKEN is missing}"
+      GATEWAY_ORCHESTRATION__BACKEND_TOKEN: "${MIRAG_TOKEN:?MIRAG_TOKEN is missing}"
+      # Spanish, because the screen is. The agents default to English on their side, so
+      # leaving this out is a Spanish page talking to an English agent — which reads as the
+      # agent refusing to answer rather than as a locale mismatch.
+      GATEWAY_ORCHESTRATION__LOCALE: "${MIRAG_LOCALE:-es}"
     depends_on: [mirag, mirag-pm]
     networks: [interna]
 
