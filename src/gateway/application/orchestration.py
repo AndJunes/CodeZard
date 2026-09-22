@@ -18,6 +18,7 @@ drawn, in which order, and with what wording is the screen's business and stays 
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -182,6 +183,17 @@ class RunOrchestrator:
                 # already be gone. `tail` holds the partial last line between chunks — an
                 # event is routinely split across two.
                 tail, artifact = _artifact_in(tail + chunk, artifact)
+        except asyncio.CancelledError:
+            # The BROWSER went away, and this is not an `Exception`: `CancelledError` derives
+            # from `BaseException`, so the clause below never saw it and the run was left
+            # sitting in BACKEND_GENERATION with no error, forever. A reconnecting tab then
+            # asked for a run that said it was still working and never would be again.
+            #
+            # Measured: the front end's proxy hit undici's 300-second body timeout during a
+            # long model call, dropped the stream, and left exactly that.
+            logger.info("run %s: the client went away mid-generation", run.id)
+            await self._runs.put(run.failed("the connection was lost during generation"))
+            raise
         except Exception as error:
             logger.warning("run %s: generation failed: %s", run.id, error)
             await self._runs.put(run.failed(f"{type(error).__name__}: {error}"))
