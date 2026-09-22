@@ -29,7 +29,7 @@ from gateway.application.proxy_service import ProxyService
 from gateway.config.settings import OrchestrationSettings
 from gateway.domain.exceptions import UpstreamError
 from gateway.domain.models import InboundRequest
-from gateway.domain.ports import RunStore
+from gateway.domain.ports import RunLog, RunStore
 from gateway.domain.runs import MAX_ROUNDS, Answer, IllegalTransitionError, Run
 
 logger = logging.getLogger(__name__)
@@ -104,11 +104,12 @@ class OrchestrationError(UpstreamError):
 class RunOrchestrator:
     """One instance, shared. It holds no per-run state: the store does."""
 
-    def __init__(self, proxy: ProxyService, runs: RunStore,
-                 settings: OrchestrationSettings) -> None:
+    def __init__(self, proxy: ProxyService, runs: RunStore, settings: OrchestrationSettings,
+                 log: RunLog) -> None:
         self._proxy = proxy
         self._runs = runs
         self._settings = settings
+        self._log = log
 
     # ── the moves ────────────────────────────────────────────────────────────
 
@@ -175,8 +176,14 @@ class RunOrchestrator:
 
         artifact = ""
         tail = b""
+        self._log.start(run.id)
         try:
             async for chunk in stream.chunks:
+                # Kept BEFORE it is yielded, so a caller that disappears mid-chunk does not
+                # take the event with it. This is the whole of reconnection: the browser held
+                # the only copy of what it had seen, and a reload lost it while the work
+                # carried on server-side with nobody able to watch.
+                self._log.append(run.id, chunk)
                 yield chunk
                 # Read along the way rather than parse afterwards: the artifact id is the one
                 # thing the run must keep, and by the time the stream ends the caller may
@@ -203,6 +210,9 @@ class RunOrchestrator:
             # a discarded stream still holds a connection from the pool. `retry.py` is the
             # precedent: whoever drops one closes it.
             await stream.aclose()
+            # However it ended — delivered, failed, or the client walking away — the readers
+            # following this log have to be let go.
+            self._log.end(run.id)
 
         await self._runs.put(run.delivered(artifact) if artifact
                              else run.failed("the agent produced no artifact"))
@@ -210,6 +220,16 @@ class RunOrchestrator:
     async def read(self, run_id: str) -> Run:
         """What a reloaded tab asks for. The whole reason the state is here."""
         return await self._runs.get(run_id)
+
+    async def events(self, run_id: str) -> AsyncIterator[bytes]:
+        """Everything this run has emitted, then everything it emits next.
+
+        `read` says WHERE a run is; this says how it got there. A tab that reconnects mid
+        generation replays what it missed and then keeps watching the same stream, rather
+        than staring at a state that will not change for another ten minutes.
+        """
+        async for chunk in self._log.follow(run_id):
+            yield chunk
 
     # ── the machinery ────────────────────────────────────────────────────────
 

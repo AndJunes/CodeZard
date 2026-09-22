@@ -224,6 +224,54 @@ class TestTokens:
         assert by_host["backend.internal"] == "backend-secret"
 
 
+class TestReplay:
+    async def test_a_finished_run_replays_its_whole_stream(
+        self, runs: httpx.AsyncClient
+    ) -> None:
+        """The reason reconnection is possible at all: the gateway kept what it forwarded."""
+        run = await reach_plan(runs)
+        await runs.post(f"/runs/{run['runId']}/approval")
+        async with runs.stream("POST", f"/runs/{run['runId']}/generation") as response:
+            first = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+        async with runs.stream("GET", f"/runs/{run['runId']}/events") as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            replayed = b"".join([chunk async for chunk in response.aiter_bytes()])
+        assert replayed == first
+
+    async def test_replaying_twice_gives_the_same_thing(
+        self, runs: httpx.AsyncClient
+    ) -> None:
+        """A GET that starts nothing and changes nothing, so two tabs can both watch."""
+        run = await reach_plan(runs)
+        await runs.post(f"/runs/{run['runId']}/approval")
+        async with runs.stream("POST", f"/runs/{run['runId']}/generation") as response:
+            [chunk async for chunk in response.aiter_bytes()]
+
+        seen = []
+        for _ in range(2):
+            async with runs.stream("GET", f"/runs/{run['runId']}/events") as response:
+                seen.append(b"".join([chunk async for chunk in response.aiter_bytes()]))
+        assert seen[0] == seen[1]
+        assert b'"name": "artifact"' in seen[0]
+
+    async def test_a_run_that_never_generated_has_an_empty_stream(
+        self, runs: httpx.AsyncClient
+    ) -> None:
+        """Empty, not an error: the run exists, it simply has not said anything yet."""
+        run = await start(runs)
+        async with runs.stream("GET", f"/runs/{run['runId']}/events") as response:
+            assert response.status_code == 200
+            assert b"".join([chunk async for chunk in response.aiter_bytes()]) == b""
+
+    async def test_an_unknown_run_is_a_404_before_anything_is_streamed(
+        self, runs: httpx.AsyncClient
+    ) -> None:
+        response = await runs.get("/runs/0000000000000000/events")
+        assert response.status_code == 404
+
+
 class TestReconnecting:
     async def test_a_run_survives_the_request_that_made_it(
         self, runs: httpx.AsyncClient

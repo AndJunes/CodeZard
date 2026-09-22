@@ -20,6 +20,7 @@ from gateway.infrastructure.resilience.circuit_breaker import (
     CircuitBreakerUpstreamClient,
 )
 from gateway.infrastructure.resilience.retry import RetryingUpstreamClient, RetryPolicy
+from gateway.infrastructure.run_log import InMemoryRunLog
 from gateway.infrastructure.runs import InMemoryRunStore
 
 
@@ -65,7 +66,8 @@ def build_container(settings: Settings, http_client: httpx.AsyncClient) -> Conta
         # The orchestrator shares the proxy, and with it the retries and the breaker: an
         # agent that is failing should not be hammered harder just because the call came
         # from inside the gateway rather than through it.
-        orchestrator=(RunOrchestrator(proxy_service, InMemoryRunStore(), orchestration)
+        orchestrator=(RunOrchestrator(proxy_service, InMemoryRunStore(), orchestration,
+                                      InMemoryRunLog())
                       if orchestration.enabled else None),
     )
 

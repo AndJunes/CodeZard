@@ -5,6 +5,7 @@ Concrete implementations live in ``gateway.infrastructure`` and are wired in
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 
 from gateway.domain.models import (
     OutboundRequest,
@@ -66,3 +67,28 @@ class RunStore(ABC):
     @abstractmethod
     async def get(self, run_id: str) -> Run:
         """The run, or raise ``RunNotFoundError``. An expired run is a missing one."""
+
+
+class RunLog(ABC):
+    """What a run has already emitted, so a tab that reconnects can catch up.
+
+    A port for the same reason ``RunStore`` is one: how long a log lives, and whether it
+    lives anywhere but this process, is a policy — and the PRD's answer today is "in memory,
+    bounded, gone on restart". The application layer should not be the place that knows.
+    """
+
+    @abstractmethod
+    def start(self, run_id: str) -> None:
+        """A generation is beginning. Any earlier log for this run is replaced."""
+
+    @abstractmethod
+    def append(self, run_id: str, chunk: bytes) -> None:
+        """Keep one chunk of the stream."""
+
+    @abstractmethod
+    def end(self, run_id: str) -> None:
+        """The generation is over, however it ended. Readers stop after draining."""
+
+    @abstractmethod
+    def follow(self, run_id: str) -> AsyncIterator[bytes]:
+        """Everything said so far, then everything said next, until the run ends."""

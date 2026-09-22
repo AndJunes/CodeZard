@@ -100,6 +100,29 @@ async def approve(run_id: str, orchestrator: OrchestratorDep,
     return run.as_json()
 
 
+@router.get("/{run_id}/events", summary="Replay a run's stream and keep following it")
+async def events(run_id: str, orchestrator: OrchestratorDep) -> StreamingResponse:
+    """What a tab that lost the connection asks for.
+
+    `GET /runs/{id}` says WHERE a run is; this says how it got there and then keeps going. It
+    is a GET on purpose — it starts nothing, changes nothing, and two tabs can follow the same
+    run without consuming each other's events.
+
+    A finished run replays and ends immediately, which is what a reload after the fact wants.
+    """
+    # The lookup happens HERE, not inside the generator. An async generator's body does not
+    # run until its first `__anext__`, which `StreamingResponse` reaches only after the
+    # response has started — so a `RunNotFoundError` raised in there arrives too late to be a
+    # 404 and surfaces as "response already started". `generate` below dodges the same edge
+    # by pulling its first chunk early; this one only needs to ask.
+    await orchestrator.read(run_id)
+    return StreamingResponse(
+        orchestrator.events(run_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/{run_id}/generation", summary="Generate the project")
 async def generate(run_id: str, orchestrator: OrchestratorDep) -> StreamingResponse:
     """The agent's own event stream, forwarded as it arrives.
