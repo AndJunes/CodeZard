@@ -16,3 +16,6 @@ htmlcov/
 
 .idea/
 .vscode/
+
+# Local compose secrets
+.env.local

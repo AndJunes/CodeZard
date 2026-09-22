@@ -12,6 +12,7 @@ from gateway.domain.models import (
     UpstreamResponse,
     UpstreamStream,
 )
+from gateway.domain.runs import Run
 
 
 class ServiceRegistry(ABC):
@@ -48,3 +49,20 @@ class UpstreamClient(ABC):
 
         The caller owns the returned stream and must await ``aclose``.
         """
+
+
+class RunStore(ABC):
+    """Where runs live between requests.
+
+    It is a port and not a dictionary in the service because the lifetime is a policy: this
+    process keeps them in memory and lets them expire, and the PRD forbids carrying them
+    between executions. Should that ever change, it changes here and nowhere else.
+    """
+
+    @abstractmethod
+    async def put(self, run: Run) -> Run:
+        """Store ``run`` under its id, replacing any earlier version. Returns what was stored."""
+
+    @abstractmethod
+    async def get(self, run_id: str) -> Run:
+        """The run, or raise ``RunNotFoundError``. An expired run is a missing one."""
