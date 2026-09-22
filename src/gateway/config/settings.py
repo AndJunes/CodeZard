@@ -66,9 +66,12 @@ class OrchestrationSettings(BaseModel):
     pm_token: str = ""
     backend_token: str = ""
     locale: str = "es"
-    plan_timeout_seconds: PositiveFloat = 600.0
-    """One PM call. Generous: measured at 246 seconds on a free model that had to be asked
-    twice, and a timeout shorter than the thing it times is just a slower way to fail."""
+
+    # There is deliberately no timeout here. A PM call was measured at 246 seconds on a free
+    # model that had to be asked twice, and it is already bounded by the service's own
+    # `read_timeout_seconds` — which the orchestrator reaches through the same ProxyService as
+    # everything else. A second knob for the same thing is a knob that will disagree with the
+    # first one.
 
 
 class RetrySettings(BaseModel):
