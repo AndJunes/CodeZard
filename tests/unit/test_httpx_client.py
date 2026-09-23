@@ -125,6 +125,8 @@ async def test_translates_transport_errors_into_domain_errors(
 
     assert exc_info.value.service_name == "users"
     assert exc_info.value.__cause__ is error
+    # Whether the service may have received it: another instance can take it only if not.
+    assert exc_info.value.request_sent is request_sent
 
 
 async def test_stream_returns_before_the_body_is_read(
@@ -176,7 +178,7 @@ async def test_the_read_timeout_can_outlast_the_connect_timeout(
     """
     service = ServiceDefinition(
         name="events",
-        base_url="http://events.internal",
+        base_urls=("http://events.internal",),
         timeout_seconds=2.0,
         read_timeout_seconds=600.0,
     )
@@ -202,8 +204,6 @@ class _Stream(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         async for chunk in self._source:
             yield chunk
-    # Whether the service may have received it: another instance can take it only if not.
-    assert exc_info.value.request_sent is request_sent
 
 
 async def test_buffers_regular_bodies_and_releases_the_connection(
@@ -225,12 +225,10 @@ async def test_relays_event_streams_chunk_by_chunk(
     body = UpstreamBody(b"data: 1\n\n", b"data: 2\n\n")
     client = make_client(lambda _: httpx.Response(200, headers=SSE, stream=body))
 
-    response = await client.send(OutboundRequest(service=users_service, method="POST", path="/"))
+    stream = await client.stream(OutboundRequest(service=users_service, method="POST", path="/"))
 
-    assert response.body == b""
-    assert response.stream is not None
-    assert [chunk async for chunk in response.stream] == [b"data: 1\n\n", b"data: 2\n\n"]
-    assert ("content-type", SSE["content-type"]) in response.headers
+    assert [chunk async for chunk in stream.chunks] == [b"data: 1\n\n", b"data: 2\n\n"]
+    assert ("content-type", SSE["content-type"]) in stream.headers
 
 
 async def test_closing_an_unread_stream_releases_the_connection(
@@ -238,9 +236,9 @@ async def test_closing_an_unread_stream_releases_the_connection(
 ) -> None:
     body = UpstreamBody(b"data: 1\n\n")
     client = make_client(lambda _: httpx.Response(200, headers=SSE, stream=body))
-    response = await client.send(OutboundRequest(service=users_service, method="POST", path="/"))
+    stream = await client.stream(OutboundRequest(service=users_service, method="POST", path="/"))
 
-    await response.aclose()
+    await stream.aclose()
 
     assert body.closed
 
@@ -260,13 +258,11 @@ async def test_translates_errors_in_the_middle_of_a_stream(
 ) -> None:
     body = UpstreamBody(b"data: 1\n\n", error=error)
     client = make_client(lambda _: httpx.Response(200, headers=SSE, stream=body))
-    response = await client.send(OutboundRequest(service=users_service, method="POST", path="/"))
-    assert response.stream is not None
-    stream = response.stream
+    stream = await client.stream(OutboundRequest(service=users_service, method="POST", path="/"))
     received: list[bytes] = []
 
     async def drain() -> None:
-        async for chunk in stream:
+        async for chunk in stream.chunks:
             received.append(chunk)
 
     with pytest.raises(expected) as exc_info:

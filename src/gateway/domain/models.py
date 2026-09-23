@@ -1,9 +1,8 @@
 """Framework-agnostic models shared by every layer."""
 
-from collections.abc import AsyncIterator, Awaitable, Callable
 import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from urllib.parse import quote
@@ -186,6 +185,8 @@ class UpstreamStream:
     headers: Headers = ()
     chunks: AsyncIterator[bytes] = field(default_factory=_no_chunks)
     aclose: Callable[[], Awaitable[None]] = _noop
+    instance_id: str | None = None
+    """The instance that produced it, so a later request can be pinned to the same one."""
 
 
 class HealthStatus(StrEnum):

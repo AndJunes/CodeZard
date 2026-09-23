@@ -11,9 +11,8 @@ from gateway import __version__
 from gateway.api.contracts import CONTRACTS
 from gateway.api.errors import register_error_handlers
 from gateway.api.middleware import RequestContextMiddleware
-from gateway.api.routes import health, proxy, runs
 from gateway.api.openapi import API_DESCRIPTION, TAGS, install_openapi
-from gateway.api.routes import health, proxy
+from gateway.api.routes import health, proxy, runs
 from gateway.bootstrap import build_container, default_http_client
 from gateway.config.settings import Settings, get_settings
 from gateway.logging_config import configure_logging

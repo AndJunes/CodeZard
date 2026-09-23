@@ -4,12 +4,12 @@ from collections import deque
 from collections.abc import AsyncIterator
 
 from gateway.domain.models import (
+    ByteStream,
     OutboundRequest,
     ServiceDefinition,
     UpstreamResponse,
     UpstreamStream,
 )
-from gateway.domain.models import ByteStream, OutboundRequest, ServiceDefinition, UpstreamResponse
 from gateway.domain.ports import UpstreamClient
 
 Outcome = UpstreamResponse | BaseException

@@ -5,16 +5,13 @@ import logging
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
+from gateway.api.schemas import ErrorDetail, ErrorResponse
 from gateway.application.orchestration import OrchestrationError
 from gateway.domain.exceptions import (
     CircuitOpenError,
     GatewayError,
-    RunNotFoundError,
-from gateway.api.schemas import ErrorDetail, ErrorResponse
-from gateway.domain.exceptions import (
-    CircuitOpenError,
-    GatewayError,
     InstanceNotFoundError,
+    RunNotFoundError,
     ServiceNotFoundError,
     UpstreamConnectionError,
     UpstreamTimeoutError,

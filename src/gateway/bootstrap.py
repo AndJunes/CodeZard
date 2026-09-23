@@ -60,19 +60,21 @@ def build_container(settings: Settings, http_client: httpx.AsyncClient) -> Conta
         failure_status_codes=breaker.failure_status_codes,
     )
 
+    resilient_client = LoadBalancingUpstreamClient(breakers)
     proxy_service = ProxyService(registry, resilient_client, HeaderPolicy())
     orchestration = settings.orchestration
     return Container(
         proxy_service=proxy_service,
-        proxy_service=ProxyService(registry, LoadBalancingUpstreamClient(breakers), HeaderPolicy()),
         # Health checks bypass retries and breakers to report the real state.
         health_service=HealthService(registry, transport),
         # The orchestrator shares the proxy, and with it the retries and the breaker: an
         # agent that is failing should not be hammered harder just because the call came
         # from inside the gateway rather than through it.
-        orchestrator=(RunOrchestrator(proxy_service, InMemoryRunStore(), orchestration,
-                                      InMemoryRunLog())
-                      if orchestration.enabled else None),
+        orchestrator=(
+            RunOrchestrator(proxy_service, InMemoryRunStore(), orchestration, InMemoryRunLog())
+            if orchestration.enabled
+            else None
+        ),
     )
 
 

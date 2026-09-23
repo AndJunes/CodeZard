@@ -39,7 +39,6 @@ class UpstreamClient(ABC):
     async def send(self, request: OutboundRequest) -> UpstreamResponse:
         """Send ``request``, read the whole body, and return the downstream response."""
 
-    @abstractmethod
     async def stream(self, request: OutboundRequest) -> UpstreamStream:
         """Send ``request`` and return as soon as the status and headers arrive.
 
@@ -48,8 +47,26 @@ class UpstreamClient(ABC):
         surfaces as whatever the transport raises, not as an ``UpstreamError``. By then the
         client already holds a status code, so there is nothing left to translate it into.
 
-        The caller owns the returned stream and must await ``aclose``.
+        The caller owns the returned stream and must await ``aclose``. Implementations may
+        override this to return as soon as headers arrive; the fallback adapts ``send`` for
+        simple clients and older test doubles.
         """
+        response = await self.send(request)
+
+        async def chunks() -> AsyncIterator[bytes]:
+            if response.stream is not None:
+                async for chunk in response.stream:
+                    yield chunk
+            elif response.body:
+                yield response.body
+
+        return UpstreamStream(
+            status_code=response.status_code,
+            headers=response.headers,
+            chunks=chunks(),
+            aclose=response.aclose,
+            instance_id=response.instance_id,
+        )
 
 
 class RunStore(ABC):
