@@ -46,6 +46,34 @@ class ServiceSettings(BaseModel):
         )
 
 
+class OrchestrationSettings(BaseModel):
+    """Which services the run orchestrator talks to, and with what.
+
+    The tokens live HERE and not in the browser's server, which is the whole point of moving
+    the orchestration: today the page's Astro server holds both agent tokens and hands them
+    to the gateway on every call, so the gateway is a pipe and the caller is trusted. Once
+    the gateway decides, the gateway is the one that has to authenticate.
+
+    Empty tokens are allowed because a local stack runs its agents open, and they say so at
+    startup. There is no default token on purpose: a factory secret is known to everybody.
+    """
+
+    enabled: bool = False
+    """Off unless asked for. A gateway with no agents behind it should not advertise routes
+    that answer 502 to everything."""
+    pm_service: str = "pm"
+    backend_service: str = "backend"
+    pm_token: str = ""
+    backend_token: str = ""
+    locale: str = "es"
+
+    # There is deliberately no timeout here. A PM call was measured at 246 seconds on a free
+    # model that had to be asked twice, and it is already bounded by the service's own
+    # `read_timeout_seconds` — which the orchestrator reaches through the same ProxyService as
+    # everything else. A second knob for the same thing is a knob that will disagree with the
+    # first one.
+
+
 class RetrySettings(BaseModel):
     max_attempts: PositiveInt = 3
     base_delay_seconds: NonNegativeFloat = 0.1
@@ -73,6 +101,7 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     max_connections: PositiveInt = 100
     services: list[ServiceSettings] = Field(default_factory=list)
+    orchestration: OrchestrationSettings = Field(default_factory=OrchestrationSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
     circuit_breaker: CircuitBreakerSettings = Field(default_factory=CircuitBreakerSettings)
 

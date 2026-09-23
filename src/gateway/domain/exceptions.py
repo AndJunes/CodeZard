@@ -41,3 +41,15 @@ class CircuitOpenError(GatewayError):
     def __init__(self, service_name: str) -> None:
         super().__init__(f"Service '{service_name}' is temporarily unavailable")
         self.service_name = service_name
+
+
+class RunNotFoundError(GatewayError):
+    """No such run, or it expired.
+
+    The two are deliberately the same answer. Telling them apart would say whether an id ever
+    existed, and a run id is the only thing protecting a run.
+    """
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__("That run does not exist, or it expired")
+        self.run_id = run_id
