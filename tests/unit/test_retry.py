@@ -143,3 +143,35 @@ def test_backoff_grows_exponentially_up_to_the_cap() -> None:
 def test_policy_rejects_invalid_values(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match=r"must be at least 1|cannot be negative"):
         RetryPolicy(**kwargs)
+
+
+async def test_closes_the_streams_it_throws_away(
+    sleep: RecordingSleep, users_service: ServiceDefinition
+) -> None:
+    """A discarded attempt holds an open connection; the loop was written when it did not.
+
+    Without this the pool would leak one connection per retry, and the symptom would be a
+    gateway that slows to a halt after a few hundred transient failures.
+    """
+    client = ScriptedUpstreamClient(
+        UpstreamResponse(status_code=503),
+        UpstreamResponse(status_code=200),
+    )
+
+    stream = await retrying(client, sleep).stream(make_request(users_service))
+
+    assert stream.status_code == 200
+    assert client.calls == 2
+    assert client.closed == 1  # the 503 was closed, the 200 belongs to the caller
+
+
+async def test_never_retries_non_idempotent_streams(
+    sleep: RecordingSleep, users_service: ServiceDefinition
+) -> None:
+    client = ScriptedUpstreamClient(UpstreamResponse(status_code=503))
+
+    stream = await retrying(client, sleep).stream(make_request(users_service, method="POST"))
+
+    assert stream.status_code == 503
+    assert client.calls == 1
+    assert client.closed == 0

@@ -1,9 +1,19 @@
+import asyncio
 import gzip
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
+from gateway.logging_config import request_id_var
+from tests.integration.conftest import (
+    FAILURE_THRESHOLD,
+    MAX_ATTEMPTS,
+    ChunkedBody,
+    ClientConnection,
+    UpstreamStub,
+    http_scope,
 from tests.integration.conftest import (
     FAILURE_THRESHOLD,
     MAX_ATTEMPTS,
@@ -115,7 +125,9 @@ async def test_returns_decoded_bodies_without_stale_encoding_headers(
 
     assert response.content == b"hello"
     assert "content-encoding" not in response.headers
-    assert response.headers["content-length"] == "5"
+    # No content-length: the body is forwarded as it arrives, so its size is not known
+    # when the headers go out. Starlette frames it chunked instead.
+    assert "content-length" not in response.headers
 
 
 async def test_unknown_service_returns_404(
@@ -237,3 +249,107 @@ async def test_unexpected_errors_return_a_generic_500(app: FastAPI) -> None:
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert "secret" not in response.text
+
+
+async def test_streamed_responses_carry_no_content_length(
+    client: httpx.AsyncClient, upstream: UpstreamStub
+) -> None:
+    upstream.respond_with(httpx.Response(200, content=b"hello"))
+
+    response = await client.get("/api/users/greeting")
+
+    assert response.content == b"hello"
+    # The size is unknown when the headers go out, so the framing is chunked instead.
+    assert "content-length" not in response.headers
+    assert response.headers["x-request-id"]
+
+
+async def test_forwards_each_chunk_as_it_arrives_instead_of_waiting_for_the_last(
+    started_app: FastAPI, upstream: UpstreamStub
+) -> None:
+    """The reason this feature exists, asserted as an ordering rather than a duration.
+
+    A service that reports progress over minutes is useless behind a gateway that waits
+    for the end. What is proven here is that the first chunk leaves the gateway *while the
+    upstream has not produced the last one yet*.
+    """
+    released = asyncio.Event()
+    arrived = asyncio.Event()
+    body_chunks: list[bytes] = []
+
+    async def slow_body() -> AsyncIterator[bytes]:
+        yield b"data: first\n\n"
+        await released.wait()
+        yield b"data: last\n\n"
+
+    upstream.responder = lambda _: httpx.Response(
+        200, stream=ChunkedBody(slow_body()), headers={"content-type": "text/event-stream"}
+    )
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            body_chunks.append(bytes(message["body"]))  # type: ignore[arg-type]
+            arrived.set()
+
+    call = asyncio.create_task(
+        started_app(http_scope("/api/users/events"), ClientConnection(), send)
+    )
+
+    await asyncio.wait_for(arrived.wait(), timeout=2)
+    assert body_chunks == [b"data: first\n\n"]
+    assert not released.is_set()
+
+    released.set()
+    await asyncio.wait_for(call, timeout=2)
+    assert body_chunks == [b"data: first\n\n", b"data: last\n\n"]
+
+
+async def test_closes_the_upstream_connection_once_the_response_is_sent(
+    started_app: FastAPI, upstream: UpstreamStub
+) -> None:
+    """Every streamed response must give its connection back to the pool."""
+    closed = asyncio.Event()
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            yield b"first"
+            yield b"second"
+        finally:
+            closed.set()
+
+    upstream.responder = lambda _: httpx.Response(200, stream=ChunkedBody(body()))
+
+    async def send(_: dict[str, object]) -> None:
+        return
+
+    await started_app(http_scope("/api/users/events"), ClientConnection(), send)
+
+    assert closed.is_set()
+
+
+async def test_logs_emitted_while_the_body_streams_still_carry_the_request_id(
+    started_app: FastAPI, upstream: UpstreamStub, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The request id has to survive as long as the response does.
+
+    With ``BaseHTTPMiddleware`` the context was released when the headers went out, so
+    anything logged while chunks were still being pumped came out attributed to nobody —
+    which is precisely when a long stream is worth diagnosing.
+    """
+    seen: list[str | None] = []
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"first"
+        seen.append(request_id_var.get())
+        yield b"last"
+
+    upstream.responder = lambda _: httpx.Response(200, stream=ChunkedBody(body()))
+
+    async def send(_: dict[str, object]) -> None:
+        return
+
+    scope = http_scope("/api/users/events")
+    scope["headers"] = [(b"host", b"gateway.test"), (b"x-request-id", b"abc123")]
+    await started_app(scope, ClientConnection(), send)
+
+    assert seen == ["abc123"]

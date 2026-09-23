@@ -9,6 +9,7 @@ from gateway.domain.models import (
     ServiceDefinition,
     ServiceHealth,
     UpstreamResponse,
+    UpstreamStream,
 )
 from gateway.domain.ports import UpstreamClient
 from gateway.infrastructure.registry import InMemoryServiceRegistry
@@ -21,6 +22,10 @@ class ClientPerService(UpstreamClient):
 
     async def send(self, request: OutboundRequest) -> UpstreamResponse:
         return await self._clients[request.service.name].send(request)
+
+    async def stream(self, request: OutboundRequest) -> UpstreamStream:
+        # Health checks never stream; the port requires the method, not a use for it.
+        return await self._clients[request.service.name].stream(request)
 
 
 async def test_healthy_service_is_up_with_latency(users_service: ServiceDefinition) -> None:

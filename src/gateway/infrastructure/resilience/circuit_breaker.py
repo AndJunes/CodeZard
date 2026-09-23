@@ -1,13 +1,17 @@
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
+from typing import TypeVar
 
 from gateway.domain.exceptions import CircuitOpenError, UpstreamError
-from gateway.domain.models import OutboundRequest, UpstreamResponse
+from gateway.domain.models import OutboundRequest, UpstreamResponse, UpstreamStream
 from gateway.domain.ports import UpstreamClient
 
 logger = logging.getLogger(__name__)
+
+# Both carry a status code, which is all the breaker looks at.
+_Outcome = TypeVar("_Outcome", UpstreamResponse, UpstreamStream)
 
 Clock = Callable[[], float]
 
@@ -105,6 +109,29 @@ class CircuitBreakerUpstreamClient(UpstreamClient):
         return self._breaker_for(target).state
 
     async def send(self, request: OutboundRequest) -> UpstreamResponse:
+        return await self._guarded(request, self._inner.send)
+
+    async def stream(self, request: OutboundRequest) -> UpstreamStream:
+        """Same guard, and the verdict still comes from the status code.
+
+        It arrives with the headers, so the decision is as informed as before for
+        everything that fails on the way in: refused connections, timeouts, 502s.
+
+        What it cannot see is a stream that dies halfway. That call is recorded as a
+        success the moment the headers land, including a HALF_OPEN probe, so a service
+        that answers and then breaks would reopen the circuit. Closing that gap means
+        wrapping the iterator to report the outcome when it ends; it is a change of its
+        own and is listed under Known limitations in the README.
+        """
+        return await self._guarded(request, self._inner.stream)
+
+    async def _guarded(
+        self,
+        request: OutboundRequest,
+        call: Callable[[OutboundRequest], Awaitable[_Outcome]],
+    ) -> _Outcome:
+        service_name = request.service.name
+        breaker = self._breaker_for(service_name)
         target = request.target
         breaker = self._breaker_for(target)
         if not breaker.try_acquire():
@@ -112,7 +139,7 @@ class CircuitBreakerUpstreamClient(UpstreamClient):
 
         previous_state = breaker.state
         try:
-            response = await self._inner.send(request)
+            outcome = await call(request)
         except UpstreamError:
             breaker.on_failure()
             self._log_transition(target, previous_state, breaker.state)
@@ -121,10 +148,12 @@ class CircuitBreakerUpstreamClient(UpstreamClient):
             breaker.on_abort()
             raise
 
-        if response.status_code in self._failure_status_codes:
+        if outcome.status_code in self._failure_status_codes:
             breaker.on_failure()
         else:
             breaker.on_success()
+        self._log_transition(service_name, previous_state, breaker.state)
+        return outcome
         self._log_transition(target, previous_state, breaker.state)
         return response
 

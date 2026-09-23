@@ -2,9 +2,10 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
 from gateway.domain.exceptions import UpstreamConnectionError, UpstreamTimeoutError
-from gateway.domain.models import OutboundRequest, UpstreamResponse
+from gateway.domain.models import OutboundRequest, UpstreamResponse, UpstreamStream
 from gateway.domain.ports import UpstreamClient
 
 logger = logging.getLogger(__name__)
@@ -12,6 +13,23 @@ logger = logging.getLogger(__name__)
 Sleep = Callable[[float], Awaitable[None]]
 
 _RETRYABLE_ERRORS = (UpstreamConnectionError, UpstreamTimeoutError)
+
+# Both carry a status code, which is all the retry decision looks at.
+_Outcome = TypeVar("_Outcome", UpstreamResponse, UpstreamStream)
+
+
+async def _discard_response(_: UpstreamResponse) -> None:
+    """A buffered response holds nothing: dropping it is free."""
+
+
+async def _discard_stream(stream: UpstreamStream) -> None:
+    """A stream holds an open connection, so dropping it has to close it.
+
+    Without this every retried attempt would leak a connection from the pool. The loop
+    below was written when discarding was free, and that assumption is only true for
+    ``UpstreamResponse``.
+    """
+    await stream.aclose()
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,21 +72,41 @@ class RetryingUpstreamClient(UpstreamClient):
         self._sleep = sleep
 
     async def send(self, request: OutboundRequest) -> UpstreamResponse:
+        return await self._attempts(request, self._inner.send, _discard_response)
+
+    async def stream(self, request: OutboundRequest) -> UpstreamStream:
+        """Same policy, and it still works: the status arrives with the headers.
+
+        What changes is the end of the road. Once the stream is handed back, the caller
+        starts writing bytes to the client, so there is no retry left to make: the client
+        already has a status code and headers. Every retry happens strictly before that.
+        """
+        return await self._attempts(request, self._inner.stream, _discard_stream)
+
+    async def _attempts(
+        self,
+        request: OutboundRequest,
+        call: Callable[[OutboundRequest], Awaitable[_Outcome]],
+        discard: Callable[[_Outcome], Awaitable[None]],
+    ) -> _Outcome:
         if not request.is_idempotent:
-            return await self._inner.send(request)
+            return await call(request)
 
         attempt = 1
         while True:
             try:
-                response = await self._inner.send(request)
+                outcome = await call(request)
             except _RETRYABLE_ERRORS as exc:
                 if attempt >= self._policy.max_attempts:
                     raise
                 reason = type(exc).__name__
             else:
                 if attempt >= self._policy.max_attempts or not self._policy.should_retry_status(
-                    response.status_code
+                    outcome.status_code
                 ):
+                    return outcome
+                reason = f"status {outcome.status_code}"
+                await discard(outcome)
                     return response
                 await response.aclose()  # discarded: free its connection before trying again
                 reason = f"status {response.status_code}"

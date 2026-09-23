@@ -1,5 +1,6 @@
 """Framework-agnostic models shared by every layer."""
 
+from collections.abc import AsyncIterator, Awaitable, Callable
 import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
@@ -41,6 +42,20 @@ class ServiceDefinition:
     """Every server running the service. Requests are spread among them."""
     timeout_seconds: float = 5.0
     health_path: str = "/health"
+    read_timeout_seconds: float | None = None
+    """Seconds allowed between two chunks; falls back to ``timeout_seconds``.
+
+    It exists because a streamed response changes what "read timeout" means. On a buffered
+    response it bounds the whole download; on a stream it bounds the *gap* between chunks.
+    A service that pushes events for ten minutes needs a long gap and a short connect, and
+    a single scalar cannot say both.
+    """
+
+    @property
+    def read_timeout(self) -> float:
+        if self.read_timeout_seconds is None:
+            return self.timeout_seconds
+        return self.read_timeout_seconds
     # Sent on every request to the service (e.g. a shared secret). Kept out of repr: they
     # usually hold credentials, and a repr ends up in logs.
     headers: Headers = field(default=(), repr=False)
@@ -147,6 +162,30 @@ class UpstreamResponse:
         """Release a streamed body. A no-op for buffered ones."""
         if self.stream is not None:
             await self.stream.aclose()
+
+
+async def _no_chunks() -> AsyncIterator[bytes]:
+    return
+    yield b""  # pragma: no cover - makes the function an async generator
+
+
+async def _noop() -> None:
+    return
+
+
+@dataclass(frozen=True, slots=True)
+class UpstreamStream:
+    """A downstream response whose body has not been read yet.
+
+    Unlike ``UpstreamResponse`` this is **not** a self-contained value: it holds a live
+    connection. Whoever receives one owns it and must await ``aclose`` exactly once, even
+    if ``chunks`` is never consumed. Forgetting leaks a connection from the pool.
+    """
+
+    status_code: int
+    headers: Headers = ()
+    chunks: AsyncIterator[bytes] = field(default_factory=_no_chunks)
+    aclose: Callable[[], Awaitable[None]] = _noop
 
 
 class HealthStatus(StrEnum):
