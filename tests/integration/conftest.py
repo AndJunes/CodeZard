@@ -18,6 +18,7 @@ from gateway.config.settings import (
 
 MAX_ATTEMPTS = 3
 FAILURE_THRESHOLD = 2
+ORDERS_TOKEN = "orders-shared-secret"
 
 
 class ChunkedBody(httpx.AsyncByteStream):
@@ -80,7 +81,10 @@ def settings() -> Settings:
         services=[
             ServiceSettings(name="users", base_url="http://users.internal"),
             ServiceSettings(
-                name="orders", base_url="http://orders.internal/v1", health_path="/status"
+                name="orders",
+                base_url="http://orders.internal/v1",
+                health_path="/status",
+                headers={"X-Orders-Token": ORDERS_TOKEN},
             ),
         ],
         retry=RetrySettings(max_attempts=MAX_ATTEMPTS, base_delay_seconds=0),

@@ -103,6 +103,16 @@ def test_clients_cannot_spoof_forwarding_headers(policy: HeaderPolicy) -> None:
     assert values_of(result, "x-request-id") == ["real"]
 
 
+def test_service_headers_replace_client_headers_with_the_same_name(policy: HeaderPolicy) -> None:
+    result = policy.for_upstream(
+        inbound((("x-mirag-token", "guessed"), ("Accept", "text/event-stream"))),
+        service_headers=(("X-Mirag-Token", "secret"),),
+    )
+
+    assert values_of(result, "x-mirag-token") == ["secret"]
+    assert ("Accept", "text/event-stream") in result
+
+
 def test_for_client_strips_stale_and_hop_by_hop_headers_but_keeps_repeated_ones(
     policy: HeaderPolicy,
 ) -> None:

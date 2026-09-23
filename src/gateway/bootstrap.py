@@ -19,6 +19,7 @@ from gateway.infrastructure.resilience.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerUpstreamClient,
 )
+from gateway.infrastructure.resilience.load_balancer import LoadBalancingUpstreamClient
 from gateway.infrastructure.resilience.retry import RetryingUpstreamClient, RetryPolicy
 from gateway.infrastructure.run_log import InMemoryRunLog
 from gateway.infrastructure.runs import InMemoryRunStore
@@ -39,8 +40,10 @@ def build_container(settings: Settings, http_client: httpx.AsyncClient) -> Conta
 
     retry = settings.retry
     breaker = settings.circuit_breaker
-    # The breaker wraps the retries: one exhausted retry sequence counts as one failure.
-    resilient_client = CircuitBreakerUpstreamClient(
+    # Outside in: the balancer picks an instance and fails over to the next one; each instance
+    # has its own breaker; the breaker wraps the retries, so one exhausted retry sequence
+    # counts as one failure of that instance.
+    breakers = CircuitBreakerUpstreamClient(
         inner=RetryingUpstreamClient(
             transport,
             RetryPolicy(
@@ -61,6 +64,7 @@ def build_container(settings: Settings, http_client: httpx.AsyncClient) -> Conta
     orchestration = settings.orchestration
     return Container(
         proxy_service=proxy_service,
+        proxy_service=ProxyService(registry, LoadBalancingUpstreamClient(breakers), HeaderPolicy()),
         # Health checks bypass retries and breakers to report the real state.
         health_service=HealthService(registry, transport),
         # The orchestrator shares the proxy, and with it the retries and the breaker: an

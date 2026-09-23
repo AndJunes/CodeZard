@@ -47,14 +47,26 @@ class ProxyService:
         )
 
     def _outbound(self, service_name: str, inbound: InboundRequest) -> OutboundRequest:
+    async def forward(
+        self, service_name: str, inbound: InboundRequest, instance_id: str | None = None
+    ) -> UpstreamResponse:
+        """``instance_id`` pins the request to one instance of the service; without it, the
+        client picks one."""
         service = self._registry.get(service_name)
         outbound = OutboundRequest(
             service=service,
             method=inbound.method,
             path=inbound.path,
-            headers=self._header_policy.for_upstream(inbound),
+            headers=self._header_policy.for_upstream(inbound, service.headers),
             query_params=inbound.query_params,
             body=inbound.body,
+            instance=service.instance(instance_id) if instance_id is not None else None,
         )
         logger.debug("Forwarding %s %s", outbound.method, outbound.url)
         return outbound
+        logger.debug("Forwarding %s %s to '%s'", outbound.method, outbound.path, outbound.target)
+
+        response = await self._client.send(outbound)
+        return dataclasses.replace(
+            response, headers=self._header_policy.for_client(response.headers)
+        )

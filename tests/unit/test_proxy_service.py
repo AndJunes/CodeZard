@@ -5,7 +5,7 @@ from gateway.application.proxy_service import ProxyService
 from gateway.domain.exceptions import ServiceNotFoundError, UpstreamTimeoutError
 from gateway.domain.models import InboundRequest, ServiceDefinition, UpstreamResponse
 from gateway.infrastructure.registry import InMemoryServiceRegistry
-from tests.fakes import ScriptedUpstreamClient
+from tests.fakes import FakeByteStream, ScriptedUpstreamClient
 
 GET_ITEMS = InboundRequest(method="GET", path="/items")
 
@@ -59,6 +59,27 @@ async def test_returns_the_upstream_response_with_filtered_headers(
     assert response == UpstreamResponse(
         status_code=201, headers=(("content-type", "application/json"),), body=b"{}"
     )
+
+
+async def test_sends_the_service_headers_instead_of_the_client_ones() -> None:
+    service = ServiceDefinition(
+        name="agent", base_urls=("http://agent.internal",), headers=(("x-token", "secret"),)
+    )
+    client = ScriptedUpstreamClient(UpstreamResponse(status_code=200))
+    inbound = InboundRequest(method="POST", path="/chat", headers=(("x-token", "forged"),))
+
+    await proxy(service, client).forward("agent", inbound)
+
+    assert [value for name, value in client.requests[0].headers if name == "x-token"] == ["secret"]
+
+
+async def test_keeps_streamed_bodies(users_service: ServiceDefinition) -> None:
+    stream = FakeByteStream(b"data: 1\n\n")
+    client = ScriptedUpstreamClient(UpstreamResponse(status_code=200, stream=stream))
+
+    response = await proxy(users_service, client).forward("users", GET_ITEMS)
+
+    assert response.stream is stream
 
 
 async def test_unknown_service_fails_without_calling_upstream(

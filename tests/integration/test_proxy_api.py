@@ -14,6 +14,11 @@ from tests.integration.conftest import (
     ClientConnection,
     UpstreamStub,
     http_scope,
+from tests.integration.conftest import (
+    FAILURE_THRESHOLD,
+    MAX_ATTEMPTS,
+    ORDERS_TOKEN,
+    UpstreamStub,
 )
 
 
@@ -53,6 +58,15 @@ async def test_maps_gateway_paths_to_service_urls(
     assert str(upstream.requests[0].url) == expected_url
 
 
+async def test_accepts_the_slashes_of_the_path_percent_encoded(
+    client: httpx.AsyncClient, upstream: UpstreamStub
+) -> None:
+    # What Swagger UI sends: it encodes the whole `path` parameter as a single segment.
+    await client.get("/api/users/items%2F1")
+
+    assert str(upstream.requests[0].url) == "http://users.internal/items/1"
+
+
 async def test_forwards_request_bodies(client: httpx.AsyncClient, upstream: UpstreamStub) -> None:
     upstream.respond_with(httpx.Response(201, json={"id": 7}))
 
@@ -63,6 +77,18 @@ async def test_forwards_request_bodies(client: httpx.AsyncClient, upstream: Upst
     assert sent.method == "POST"
     assert sent.content == b'{"name":"Ada"}'
     assert sent.headers["content-type"] == "application/json"
+
+
+async def test_injects_the_service_credential_and_ignores_the_client_one(
+    client: httpx.AsyncClient, upstream: UpstreamStub
+) -> None:
+    await client.post("/api/orders/chat", json={}, headers={"x-orders-token": "forged"})
+    await client.get("/api/users/items")
+
+    to_orders, to_users = upstream.requests
+    assert to_orders.headers.get_list("x-orders-token") == [ORDERS_TOKEN]
+    # A credential belongs to its service: no other service ever receives it.
+    assert "x-orders-token" not in to_users.headers
 
 
 async def test_passes_upstream_client_errors_through_unchanged(

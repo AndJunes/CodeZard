@@ -9,9 +9,25 @@ from gateway.domain.models import (
     UpstreamResponse,
     UpstreamStream,
 )
+from gateway.domain.models import ByteStream, OutboundRequest, ServiceDefinition, UpstreamResponse
 from gateway.domain.ports import UpstreamClient
 
 Outcome = UpstreamResponse | BaseException
+
+
+class FakeByteStream(ByteStream):
+    """Yields the given chunks and records whether it was released."""
+
+    def __init__(self, *chunks: bytes) -> None:
+        self._chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class ScriptedUpstreamClient(UpstreamClient):

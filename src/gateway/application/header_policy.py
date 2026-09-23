@@ -32,15 +32,18 @@ _STALE_RESPONSE_HEADERS = frozenset({"content-encoding", "content-length"})
 class HeaderPolicy:
     """Filters headers and adds the standard proxy forwarding headers."""
 
-    def for_upstream(self, inbound: InboundRequest) -> Headers:
+    def for_upstream(self, inbound: InboundRequest, service_headers: Headers = ()) -> Headers:
+        """``service_headers`` (configured per service) replace any client header of the same
+        name, so a client can neither read nor override a credential the gateway injects."""
         dropped = (
             HOP_BY_HOP_HEADERS
             | _RECOMPUTED_REQUEST_HEADERS
             | _FORWARDING_HEADERS
             | _connection_tokens(inbound.headers)
+            | {name.lower() for name, _ in service_headers}
         )
         kept = [(name, value) for name, value in inbound.headers if name.lower() not in dropped]
-        return (*kept, *self._forwarding_headers(inbound))
+        return (*kept, *self._forwarding_headers(inbound), *service_headers)
 
     def for_client(self, headers: Headers) -> Headers:
         dropped = HOP_BY_HOP_HEADERS | _STALE_RESPONSE_HEADERS | _connection_tokens(headers)

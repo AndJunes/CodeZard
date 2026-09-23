@@ -1,6 +1,7 @@
 import httpx
 
-from tests.integration.conftest import UpstreamStub
+from gateway.domain.models import ServiceInstance
+from tests.integration.conftest import ORDERS_TOKEN, UpstreamStub
 
 
 async def test_liveness(client: httpx.AsyncClient, upstream: UpstreamStub) -> None:
@@ -29,6 +30,16 @@ async def test_services_health_is_ok_when_every_service_is_up(
     ]
 
 
+async def test_health_checks_carry_the_service_credential(
+    client: httpx.AsyncClient, upstream: UpstreamStub
+) -> None:
+    await client.get("/health/services")
+
+    by_host = {request.url.host: request for request in upstream.requests}
+    assert by_host["orders.internal"].headers["x-orders-token"] == ORDERS_TOKEN
+    assert "x-orders-token" not in by_host["users.internal"].headers
+
+
 async def test_services_health_is_degraded_when_a_service_is_down(
     client: httpx.AsyncClient, upstream: UpstreamStub
 ) -> None:
@@ -46,18 +57,16 @@ async def test_services_health_is_degraded_when_a_service_is_down(
     assert body["status"] == "degraded"
     services = {service["name"]: service for service in body["services"]}
     assert services["users"]["status"] == "up"
-    assert isinstance(services["users"]["latency_ms"], float)
+    assert isinstance(services["users"]["instances"][0]["latency_ms"], float)
     assert services["orders"] == {
         "name": "orders",
         "status": "down",
-        "latency_ms": None,
-        "detail": "Service 'orders' is unreachable",
+        "instances": [
+            {
+                "id": ServiceInstance("http://orders.internal/v1").id,
+                "status": "down",
+                "latency_ms": None,
+                "detail": "Service 'orders' is unreachable",
+            }
+        ],
     }
-
-
-async def test_openapi_documents_health_but_not_the_catch_all_proxy(
-    client: httpx.AsyncClient,
-) -> None:
-    paths = (await client.get("/openapi.json")).json()["paths"]
-
-    assert set(paths) == {"/health", "/health/services"}

@@ -2,19 +2,25 @@
 
 Nested values use ``__`` as delimiter, e.g. ``GATEWAY_RETRY__MAX_ATTEMPTS=5``.
 Lists are given as JSON, e.g.
-``GATEWAY_SERVICES='[{"name": "users", "base_url": "http://users:8001"}]'``.
+``GATEWAY_SERVICES='[{"name": "users", "base_url": "http://users:8001"}]'``, or with several
+instances of a service, ``"base_urls": ["http://users-1:8001", "http://users-2:8001"]``.
 """
 
 from functools import lru_cache
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     HttpUrl,
     NonNegativeFloat,
     PositiveFloat,
     PositiveInt,
+    SecretStr,
+    StringConstraints,
+    field_validator,
+    model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -22,10 +28,19 @@ from gateway.domain.models import ServiceDefinition
 
 _DEFAULT_TRANSIENT_STATUS = frozenset({502, 503, 504})
 
+# RFC 9110 §5.6.2 token.
+HeaderName = Annotated[str, StringConstraints(pattern=r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")]
+
 
 class ServiceSettings(BaseModel):
+    # Validation errors quote the offending input, and here that input can hold a credential
+    # (`headers`) that would end up in the startup logs. The location and reason still show.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     name: Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]*$")]
-    base_url: HttpUrl
+    # One of the two: a single server, or several interchangeable instances of the service.
+    base_url: HttpUrl | None = None
+    base_urls: list[HttpUrl] = Field(default_factory=list)
     timeout_seconds: PositiveFloat = 5.0
     health_path: str = "/health"
     read_timeout_seconds: PositiveFloat | None = None
@@ -35,14 +50,39 @@ class ServiceSettings(BaseModel):
     ``timeout_seconds`` short: the first bounds silence between events, the second bounds
     connecting.
     """
+    headers: dict[HeaderName, SecretStr] = Field(default_factory=dict)
+
+    @field_validator("headers")
+    @classmethod
+    def _header_values_are_single_line(cls, headers: dict[str, SecretStr]) -> dict[str, SecretStr]:
+        for name, value in headers.items():
+            secret = value.get_secret_value()
+            # A line break would let the value inject extra headers.
+            if not secret or any(char in secret for char in "\r\n\0"):
+                raise ValueError(f"header '{name}' must be a non-empty single line")
+        return headers
+
+    @model_validator(mode="after")
+    def _servers_are_given_once(self) -> Self:
+        if (self.base_url is None) == (not self.base_urls):
+            raise ValueError("set exactly one of 'base_url' and 'base_urls'")
+        urls = self._normalized_urls()
+        if len(set(urls)) != len(urls):
+            raise ValueError("'base_urls' lists the same server twice")
+        return self
+
+    def _normalized_urls(self) -> tuple[str, ...]:
+        urls = self.base_urls if self.base_url is None else [self.base_url]
+        return tuple(str(url).rstrip("/") for url in urls)
 
     def to_definition(self) -> ServiceDefinition:
         return ServiceDefinition(
             name=self.name,
-            base_url=str(self.base_url).rstrip("/"),
+            base_urls=self._normalized_urls(),
             timeout_seconds=self.timeout_seconds,
             health_path=self.health_path,
             read_timeout_seconds=self.read_timeout_seconds,
+            headers=tuple((name, value.get_secret_value()) for name, value in self.headers.items()),
         )
 
 
@@ -93,6 +133,9 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
         env_file=".env",
         extra="ignore",
+        # Errors are raised by this model even when they happen inside a service entry, so
+        # hiding inputs there alone would still quote the entry, headers included.
+        hide_input_in_errors=True,
     )
 
     app_name: str = "API Gateway"

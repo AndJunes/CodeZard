@@ -107,6 +107,9 @@ class RetryingUpstreamClient(UpstreamClient):
                     return outcome
                 reason = f"status {outcome.status_code}"
                 await discard(outcome)
+                    return response
+                await response.aclose()  # discarded: free its connection before trying again
+                reason = f"status {response.status_code}"
 
             delay = self._policy.delay_for(attempt)
             logger.warning(

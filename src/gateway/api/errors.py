@@ -10,6 +10,11 @@ from gateway.domain.exceptions import (
     CircuitOpenError,
     GatewayError,
     RunNotFoundError,
+from gateway.api.schemas import ErrorDetail, ErrorResponse
+from gateway.domain.exceptions import (
+    CircuitOpenError,
+    GatewayError,
+    InstanceNotFoundError,
     ServiceNotFoundError,
     UpstreamConnectionError,
     UpstreamTimeoutError,
@@ -26,6 +31,7 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     # plan is approved is the case this exists for, and it is now decided by the run's own
     # state instead of by a `status` field in the body the caller sent.
     IllegalTransitionError: (status.HTTP_409_CONFLICT, "illegal_transition"),
+    InstanceNotFoundError: (status.HTTP_404_NOT_FOUND, "instance_not_found"),
     UpstreamConnectionError: (status.HTTP_502_BAD_GATEWAY, "bad_gateway"),
     # An agent answered and what it said cannot be used — it asked past the round cap, or
     # returned a plan with nothing in it. Not a 500: nothing here failed, the machine behind
@@ -45,16 +51,14 @@ def classify(exc: Exception) -> tuple[int, str]:
 
 
 def error_response(request: Request, status_code: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "error": {
-                "code": code,
-                "message": message,
-                "request_id": getattr(request.state, "request_id", None),
-            }
-        },
+    body = ErrorResponse(
+        error=ErrorDetail(
+            code=code,
+            message=message,
+            request_id=getattr(request.state, "request_id", None),
+        )
     )
+    return JSONResponse(status_code=status_code, content=body.model_dump())
 
 
 async def _handle_gateway_error(request: Request, exc: Exception) -> JSONResponse:

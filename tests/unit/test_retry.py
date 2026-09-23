@@ -5,7 +5,7 @@ import pytest
 from gateway.domain.exceptions import UpstreamConnectionError, UpstreamTimeoutError
 from gateway.domain.models import ServiceDefinition, UpstreamResponse
 from gateway.infrastructure.resilience.retry import RetryingUpstreamClient, RetryPolicy
-from tests.fakes import RecordingSleep, ScriptedUpstreamClient, make_request
+from tests.fakes import FakeByteStream, RecordingSleep, ScriptedUpstreamClient, make_request
 
 OK = UpstreamResponse(status_code=200, body=b"ok")
 UNAVAILABLE = UpstreamResponse(status_code=503)
@@ -71,6 +71,18 @@ async def test_retries_transient_status_codes(
 
     assert response is OK
     assert inner.calls == 2
+
+
+async def test_releases_the_streamed_responses_it_discards(
+    users_service: ServiceDefinition, sleep: RecordingSleep
+) -> None:
+    discarded = FakeByteStream()
+    inner = ScriptedUpstreamClient(UpstreamResponse(status_code=503, stream=discarded), OK)
+
+    response = await retrying(inner, sleep).send(make_request(users_service))
+
+    assert response is OK
+    assert discarded.closed
 
 
 async def test_returns_transient_status_when_attempts_are_exhausted(
