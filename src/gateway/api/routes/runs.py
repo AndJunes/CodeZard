@@ -19,6 +19,7 @@ from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from gateway.api.payment_gate import PayerDep
 from gateway.application.orchestration import RunOrchestrator
 from gateway.bootstrap import Container
 from gateway.domain.runs import MAX_IDEA_CHARS, Answer
@@ -57,8 +58,18 @@ class RejectBody(BaseModel):
 
 
 @router.post("", summary="Start a run from an idea")
-async def start(body: StartBody, orchestrator: OrchestratorDep) -> dict[str, Any]:
-    run = await orchestrator.start(body.idea)
+async def start(body: StartBody, orchestrator: OrchestratorDep, payer: PayerDep) -> dict[str, Any]:
+    """The one route that decides who pays, because it is the one that starts spending.
+
+    ``payer`` is ``""`` on a gateway that is not charging, and everything below behaves as it
+    always did. When it is charging, this dependency has already refused with a 402 — and a
+    price — if the caller has neither a session with a balance nor a payment.
+
+    Nothing further down asks again: the account is written onto the run at this moment and
+    read from there. Taking it from whoever later asks for the generation would let one
+    signed-in caller spend another's balance by naming their run id.
+    """
+    run = await orchestrator.start(body.idea, payer)
     return run.as_json()
 
 

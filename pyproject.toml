@@ -18,6 +18,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Only two things in this gateway genuinely need Stellar's cryptography: verifying a sign-in
+# signature, and reading what a signed x402 envelope actually pays. Everything else about
+# billing — watching for a payment, quoting a price, submitting a transaction — is plain HTTP
+# against Horizon with the client that is already here. So this is an extra, and a deployment
+# without it keeps every other capability and says exactly which two it lacks.
+stellar = ["stellar-sdk>=16.1.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
@@ -61,3 +67,10 @@ python_version = "3.11"
 strict = true
 plugins = ["pydantic.mypy"]
 mypy_path = "src"
+
+# `stellar-sdk` is an optional extra and ships no stubs. A type check has to pass on a
+# machine that does not have it installed — which is every machine where billing is off —
+# and the two places that import it already handle its absence at runtime.
+[[tool.mypy.overrides]]
+module = ["stellar_sdk.*"]
+ignore_missing_imports = true

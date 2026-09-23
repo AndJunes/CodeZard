@@ -27,6 +27,7 @@ from typing import Any
 
 from gateway.application.proxy_service import ProxyService
 from gateway.config.settings import OrchestrationSettings
+from gateway.domain.billing import Usage
 from gateway.domain.exceptions import (
     ConsoleDisabledError,
     NoProjectError,
@@ -34,7 +35,7 @@ from gateway.domain.exceptions import (
     UpstreamError,
 )
 from gateway.domain.models import InboundRequest, UpstreamStream
-from gateway.domain.ports import RunLog, RunStore
+from gateway.domain.ports import RunLog, RunMeter, RunStore
 from gateway.domain.runs import MAX_ROUNDS, Answer, IllegalTransitionError, Run
 
 logger = logging.getLogger(__name__)
@@ -118,18 +119,33 @@ class RunOrchestrator:
     """One instance, shared. It holds no per-run state: the store does."""
 
     def __init__(
-        self, proxy: ProxyService, runs: RunStore, settings: OrchestrationSettings, log: RunLog
+        self,
+        proxy: ProxyService,
+        runs: RunStore,
+        settings: OrchestrationSettings,
+        log: RunLog,
+        meter: RunMeter | None = None,
     ) -> None:
         self._proxy = proxy
         self._runs = runs
         self._settings = settings
         self._log = log
+        self._meter = meter
+        """Billing, or ``None``. A gateway that is not charging behaves exactly as before:
+        every call to it is guarded, and no path here changes shape because of it."""
 
     # ── the moves ────────────────────────────────────────────────────────────
 
-    async def start(self, idea: str) -> Run:
-        """An idea becomes a run, and the PM is asked what it understood."""
-        run = Run.start(idea).describing()
+    async def start(self, idea: str, account: str = "") -> Run:
+        """An idea becomes a run, and the PM is asked what it understood.
+
+        Authorised BEFORE the first model call, which is the only honest moment to refuse:
+        the PM analysis costs money too, and an account that cannot pay should be told so
+        while there is still nothing to lose.
+        """
+        if self._meter is not None and account:
+            await self._meter.authorize(account)
+        run = Run.start(idea, account).describing()
         answer = await self._ask_pm("analyze", {"idea": run.idea})
         summary = str(answer.get("summary") or "")
         questionnaire = answer.get("questionnaire")
@@ -196,8 +212,7 @@ class RunOrchestrator:
             ),
         )
 
-        artifact = ""
-        tail = b""
+        scan = StreamScan()
         self._log.start(run.id)
         try:
             async for chunk in stream.chunks:
@@ -207,11 +222,10 @@ class RunOrchestrator:
                 # carried on server-side with nobody able to watch.
                 self._log.append(run.id, chunk)
                 yield chunk
-                # Read along the way rather than parse afterwards: the artifact id is the one
-                # thing the run must keep, and by the time the stream ends the caller may
-                # already be gone. `tail` holds the partial last line between chunks — an
-                # event is routinely split across two.
-                tail, artifact = _artifact_in(tail + chunk, artifact)
+                # Read along the way rather than parse afterwards: the artifact id and what
+                # the run consumed are the two things the run must keep, and by the time the
+                # stream ends the caller may already be gone.
+                scan.feed(chunk)
         except asyncio.CancelledError:
             # The BROWSER went away, and this is not an `Exception`: `CancelledError` derives
             # from `BaseException`, so the clause below never saw it and the run was left
@@ -236,9 +250,32 @@ class RunOrchestrator:
             # following this log have to be let go.
             self._log.end(run.id)
 
-        await self._runs.put(
-            run.delivered(artifact) if artifact else run.failed("the agent produced no artifact")
-        )
+        if not scan.artifact:
+            await self._runs.put(run.failed("the agent produced no artifact"))
+            return
+        delivered = run.delivered(scan.artifact)
+        await self._runs.put(await self._charge(delivered, scan.usage))
+
+    async def _charge(self, run: Run, usage: Usage) -> Run:
+        """Debit what the run consumed, once it has actually delivered something.
+
+        Only on delivery, and that is a decision rather than an oversight. A generation that
+        dies halfway has still cost us what the model charged, and billing a person for a ZIP
+        they never received is the kind of thing that is technically defensible and loses the
+        customer. The spend shows up in our own costs; it does not show up in theirs.
+
+        A failure to bill never fails the run either. The project exists, the caller is
+        watching it arrive, and a ledger that could not be written is our problem to notice in
+        the logs — not a reason to turn a finished generation into an error.
+        """
+        if self._meter is None or not run.account or usage.is_empty:
+            return run
+        try:
+            entry = await self._meter.charge(run.account, run.id, usage)
+        except Exception as error:
+            logger.error("run %s could not be charged: %s", run.id, error)
+            return run
+        return run.billed(abs(getattr(entry, "tokens", 0))) if entry is not None else run
 
     async def read(self, run_id: str) -> Run:
         """What a reloaded tab asks for. The whole reason the state is here."""
@@ -426,36 +463,75 @@ def _is_plan(answer: Any) -> bool:
 ARTIFACT_ID = re.compile(rb"\b([0-9a-f]{24})\b")
 """The agent's artifact ids. Used only as the fallback below."""
 
+MAX_TAIL = 8192
+"""Cap on the partial last line kept between chunks, so a stream with no newline at all
+cannot grow without bound."""
 
-def _artifact_in(buffer: bytes, found: str) -> tuple[bytes, str]:
-    """Scan complete SSE lines for the artifact id; return the incomplete tail and the id.
 
-    Reading the id as the stream goes is not an optimisation. The caller can disconnect at any
-    moment — closing the tab is the normal way this ends — and the run still has to know what
-    was produced so a reconnect can offer the download.
+class StreamScan:
+    """Reads the agent's stream as it goes past, keeping the two things the run must outlive it by.
 
-    The id is taken from the `done` event's `project.id`, which is a field. The `artifact`
-    step LOOKS like the obvious source and is not: its `detail` is null and the id appears
-    only inside its human-readable summary, so reading it there means parsing a sentence
-    written for a person. That sentence is the fallback, for a stream cut off before `done`.
+    Reading along the way is not an optimisation. The caller can disconnect at any moment —
+    closing the tab is the normal way this ends — and the run still has to know what was
+    produced, so a reconnect can offer the download, and what it consumed, so it can be
+    billed.
+
+    The artifact id is taken from the `done` event's `project.id`, which is a field. The
+    `artifact` step LOOKS like the obvious source and is not: its `detail` is null and the id
+    appears only inside its human-readable summary, so reading it there means parsing a
+    sentence written for a person. That sentence is the fallback, for a stream cut off before
+    `done`.
+
+    The usage comes from the `done` event's `cost.usage` object and from nowhere else. The
+    same panel carries a `text` field — "$0.0123", "gratis", "salió de un guion" — written for
+    a person and free to change wording. A billing input parsed out of a sentence is a billing
+    input that will one day be parsed wrong.
     """
-    lines = buffer.split(b"\n")
-    for line in lines[:-1]:
+
+    __slots__ = ("_tail", "artifact", "usage")
+
+    def __init__(self) -> None:
+        self.artifact = ""
+        self.usage = Usage()
+        self._tail = b""
+
+    def feed(self, chunk: bytes) -> None:
+        """Take one chunk. An SSE event is routinely split across two of them."""
+        buffer = self._tail + chunk
+        lines = buffer.split(b"\n")
+        self._tail = lines[-1][-MAX_TAIL:]
+        for line in lines[:-1]:
+            self._read(line)
+
+    def _read(self, line: bytes) -> None:
         if not line.startswith(b"data: "):
-            continue
+            return
         try:
             event = json.loads(line[6:])
         except ValueError:
-            continue
+            return
         if not isinstance(event, Mapping):
-            continue
-        project = event.get("project")
-        if event.get("type") == "done" and isinstance(project, Mapping) and project.get("id"):
-            return lines[-1][-8192:], str(project["id"])
-        if not found and event.get("name") == "artifact" and (match := ARTIFACT_ID.search(line)):
-            found = match.group(1).decode()
-    # Cap the tail so a stream with no newline at all cannot grow without bound.
-    return lines[-1][-8192:], found
+            return
+        if event.get("type") == "done":
+            project = event.get("project")
+            if isinstance(project, Mapping) and project.get("id"):
+                self.artifact = str(project["id"])
+            cost = event.get("cost")
+            if isinstance(cost, Mapping):
+                self.usage = Usage.from_agent(cost)
+            return
+        if (
+            not self.artifact
+            and event.get("name") == "artifact"
+            and (match := ARTIFACT_ID.search(line))
+        ):
+            self.artifact = match.group(1).decode()
 
 
-__all__ = ["IllegalTransitionError", "OrchestrationError", "RunOrchestrator", "prompt_for"]
+__all__ = [
+    "IllegalTransitionError",
+    "OrchestrationError",
+    "RunOrchestrator",
+    "StreamScan",
+    "prompt_for",
+]

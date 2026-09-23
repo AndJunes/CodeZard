@@ -46,6 +46,97 @@ it, jump to [Getting started](#getting-started).
 - **Run orchestration** (opt-in): `/runs` drives the PM and the backend agent through one
   idea → plan → approval → project flow, holds their tokens and streams the progress (see
   [The CodeZard flow](#the-codezard-flow-runs)).
+- **Billing** (opt-in): subscriptions and prepaid token packs, metered against what a run
+  really consumed and settled on Stellar, plus **HTTP 402 / x402** for callers that would
+  rather pay per request than hold an account (see [Billing](#billing)).
+
+## Billing
+
+Off by default. With `GATEWAY_BILLING__ENABLED=false` — the default — `POST /runs` charges
+nobody and every existing caller behaves exactly as it did before any of this existed.
+
+**What is sold.** Tokens, because tokens are what a run consumes. Selling seats would mean
+guessing; a subscription is a monthly grant of tokens and a pack is a purchase of them, and
+the two differ only in shelf life — a grant expires with its period, a purchase never does.
+
+**What is charged.** What the run *cost*, marked up, expressed in tokens — not the raw token
+count the model reported. Otherwise switching to a cheaper or dearer model silently rewrites
+the price of everything sold so far. The numbers come from the agent's `cost.usage` object and
+never from its `cost_summary` sentence, which is written for a person and free to change
+wording.
+
+**When.** A run is **authorised** before it starts and **charged** after it finishes. Those
+are different questions: authorising may refuse, charging may not — the work is done and the
+provider has been paid. A generation that fails is our loss, not the customer's, and is never
+billed.
+
+**Who is calling.** An account *is* a Stellar address. Signing in is: the server states a
+challenge, the wallet signs it, the server checks the signature. No password to store, no
+reset flow to abuse, and the key that proves ownership is the key that pays. The session token
+is an HMAC of the claims under a server secret — there is no session table to grow or leak.
+
+**The ledger** is append-only and lives in SQLite: a balance is the sum of what happened, not
+a number someone keeps up to date, so "why was I charged this" is always answerable by listing
+rows. Every write carries an idempotency reference, because confirming a payment is triggered
+by a poller, by the payer refreshing and by the endpoint, routinely at once.
+
+### Paying without an account (x402)
+
+A program calling this gateway is not a person and should not have to sign up. `POST /runs`
+without a session answers `402` with the protocol's own document — `{x402Version, error,
+accepts: [...]}` — the client pays, retries with `X-PAYMENT`, and the tokens are credited to
+whichever address actually signed. Same ledger, same price.
+
+```
+GET  /x402/supported     which (scheme, network) pairs this speaks
+POST /x402/quote         payment requirements for a resource, on request instead of as a refusal
+POST /x402/verify        would this envelope pay? nothing is submitted   (facilitator)
+POST /x402/settle        submit it and report what the ledger said       (facilitator)
+```
+
+The scheme is `exact` and the network is Stellar, so the proof is a signed Stellar envelope.
+Every number that matters is read back out of the *signed bytes* — the payload's own claims
+are never trusted — and the signature is checked against the configured network's passphrase,
+which is the only thing that stops an envelope signed for testnet from being accepted here.
+
+### The routes
+
+```
+GET  /billing/plans              public: what is on sale and what a token costs
+POST /billing/auth/challenge     the text a wallet has to sign
+POST /billing/auth/verify        a signed challenge becomes a session
+GET  /billing                    balance, subscription and recent movements   (bearer)
+POST /billing/checkout           an invoice with a frozen amount and a memo    (bearer)
+GET  /billing/invoices/{id}      has it been paid? safe to poll                (bearer)
+```
+
+### Turning it on
+
+```bash
+# Generate the secret; do not invent one. A factory secret would forge sign-ins.
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+```ini
+GATEWAY_BILLING__ENABLED=true
+GATEWAY_BILLING__NETWORK=testnet       # `public` is real money and needs ALLOW_MAINNET too
+GATEWAY_BILLING__DESTINATION=G...      # where payments arrive; no secret key is held here
+GATEWAY_BILLING__SECRET=...            # signs session tokens
+GATEWAY_BILLING__XLM_USD=0.10          # fallback rate when the DEX cannot be asked
+```
+
+Checking a signature and reading a signed envelope are the only two things that need Stellar's
+cryptography, so they live behind an optional extra. Everything else about billing — watching
+for a payment, quoting a price, submitting a transaction — is plain HTTP against Horizon with
+the client this gateway already has.
+
+```bash
+pip install -e ".[stellar]"   # without it, sign-in answers 501 and says exactly why
+```
+
+Mainnet is refused unless `GATEWAY_BILLING__ALLOW_MAINNET=true` is set as well. Two settings
+for one decision, on purpose: a typo, a copied `.env` or an inherited environment variable can
+produce `public`, and none of them can produce both.
 
 ## Architecture
 
@@ -54,21 +145,31 @@ src/gateway/
 ├── domain/            # Models, errors and ports (interfaces). No external dependencies.
 │   ├── models.py
 │   ├── exceptions.py
-│   └── ports.py       # ServiceRegistry, UpstreamClient (ABCs)
+│   ├── runs.py                # The run state machine
+│   ├── billing.py             # Money, plans, the ledger, invoices. No HTTP, no SQL, no Stellar.
+│   ├── x402.py                # The HTTP 402 wire format, as values
+│   └── ports.py       # ServiceRegistry, UpstreamClient, BillingStore, PaymentNetwork (ABCs)
 ├── application/       # Use cases: depend only on the ports.
 │   ├── proxy_service.py
 │   ├── health_service.py
 │   ├── header_policy.py
-│   └── orchestration.py       # RunOrchestrator: the CodeZard flow behind /runs
+│   ├── orchestration.py       # RunOrchestrator: the CodeZard flow behind /runs
+│   ├── billing_service.py     # Selling, granting, and debiting what a run consumed
+│   ├── identity_service.py    # Challenge → signature → session. No passwords anywhere.
+│   └── x402_service.py        # Being payable over 402, and being a facilitator for it
 ├── infrastructure/    # Concrete implementations of the ports.
 │   ├── registry.py            # InMemoryServiceRegistry
 │   ├── httpx_client.py        # HttpxUpstreamClient
+│   ├── billing/
+│   │   ├── sqlite_store.py    # The append-only ledger, durable
+│   │   └── stellar.py         # Horizon over httpx; the SDK only where cryptography is needed
 │   └── resilience/
 │       ├── load_balancer.py   # LoadBalancingUpstreamClient (decorator)
 │       ├── circuit_breaker.py # CircuitBreakerUpstreamClient (decorator)
 │       └── retry.py           # RetryingUpstreamClient (decorator)
 ├── api/               # HTTP layer (FastAPI): routes, middleware, errors, adapters.
-│   ├── routes/        # health, the generic proxy, and runs (the CodeZard flow).
+│   ├── routes/        # health, the generic proxy, runs, billing and x402.
+│   ├── payment_gate.py # Who pays for a run: a session, a payment, or a 402 with the price.
 │   ├── openapi.py     # The OpenAPI document behind Swagger UI.
 │   └── contracts/     # Routes of downstream services documented in Swagger (mirag.py).
 ├── config/settings.py # Typed configuration (pydantic-settings).
