@@ -76,7 +76,8 @@ class ConsoleDisabledError(GatewayError):
 
     def __init__(self) -> None:
         super().__init__(
-            "The console is switched off on this gateway (GATEWAY_ORCHESTRATION__CONSOLE)")
+            "The console is switched off on this gateway (GATEWAY_ORCHESTRATION__CONSOLE)"
+        )
 
 
 class NoProjectError(GatewayError):

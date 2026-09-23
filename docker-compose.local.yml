@@ -21,9 +21,11 @@ name: codezard-local
 services:
   # Both agents, ONE process — agente-backend/src/mirag_manager. It builds the SAME two
   # containers `mirag serve` and `mirag-pm serve` used to build as two separate services, and
-  # answers for both behind one port: "/backend/..." is the backend agent (ONLINE — see the
-  # note this replaced, on `mirag`, below), "/pm/..." is the PM (also online: none of its three
-  # operations has a scripted double, and with the lock on it answers 502 saying exactly that).
+  # answers for both behind one port: "/backend/..." is the backend agent and "/pm/..." is the
+  # PM. Both run ONLINE here (MIRAG_OFFLINE below is "0"). The PM does have a scripted double
+  # behind the lock (agente-backend/src/mirag_pm/offline.py: with MIRAG_OFFLINE=1 it replays one
+  # fixed plan, labelled simulated), which is what makes the flow rehearsable without a key. This
+  # file is for real model calls, so it does not use it.
   #
   # What this bought: one `depends_on`, one health check, one image build, one command. What it
   # cost: the two agents now share a token (below) and a process environment, so their models

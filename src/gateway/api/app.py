@@ -52,8 +52,10 @@ def create_app(
     if settings.orchestration.enabled:
         app.include_router(runs.router)
         if not (settings.orchestration.pm_token and settings.orchestration.backend_token):
-            logger.warning("Orchestration is on and at least one agent token is empty: "
-                           "the agents behind this gateway are open to whoever reaches them.")
+            logger.warning(
+                "Orchestration is on and at least one agent token is empty: "
+                "the agents behind this gateway are open to whoever reaches them."
+            )
     app.include_router(proxy.router)
     install_openapi(app, (service.name for service in settings.services), CONTRACTS)
     return app

@@ -76,7 +76,8 @@ async def read(run_id: str, orchestrator: OrchestratorDep) -> dict[str, Any]:
 @router.post("/{run_id}/answers", summary="Answer the current questionnaire")
 async def answer(run_id: str, body: AnswersBody, orchestrator: OrchestratorDep) -> dict[str, Any]:
     run = await orchestrator.answer(
-        run_id, [Answer(question_id=a.questionId, value=a.value) for a in body.answers])
+        run_id, [Answer(question_id=a.questionId, value=a.value) for a in body.answers]
+    )
     return run.as_json()
 
 
@@ -87,8 +88,9 @@ async def reject(run_id: str, body: RejectBody, orchestrator: OrchestratorDep) -
 
 
 @router.post("/{run_id}/approval", summary="Approve the plan")
-async def approve(run_id: str, orchestrator: OrchestratorDep,
-                  _: Annotated[dict[str, Any] | None, Body()] = None) -> dict[str, Any]:
+async def approve(
+    run_id: str, orchestrator: OrchestratorDep, _: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
     """The gate, and it takes no body ON PURPOSE.
 
     There is nothing for the caller to say here. The old design had the browser set

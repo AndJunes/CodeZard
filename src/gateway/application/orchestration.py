@@ -69,14 +69,22 @@ def prompt_for(plan: Mapping[str, Any]) -> str:
     if roles := _items(plan.get("roles")):
         sections.append("Roles: " + "; ".join(str(r.get("name") or "") for r in roles))
     if flows := _items(plan.get("flows")):
-        sections.append("Flujos: " + "; ".join(
-            f"{f.get('name')}: {' → '.join(str(s) for s in _list(f.get('steps')))}" for f in flows))
+        sections.append(
+            "Flujos: "
+            + "; ".join(
+                f"{f.get('name')}: {' → '.join(str(s) for s in _list(f.get('steps')))}"
+                for f in flows
+            )
+        )
     if constraints := _items(plan.get("constraints")):
-        sections.append("Restricciones: " + "; ".join(
-            str(c.get("statement") or "") for c in constraints))
+        sections.append(
+            "Restricciones: " + "; ".join(str(c.get("statement") or "") for c in constraints)
+        )
     if open_questions := [str(q) for q in _list(plan.get("openQuestions"))]:
-        sections.append("Decisiones que el plan deja abiertas (resolvelas y dejá dicho qué "
-                        "asumiste): " + "; ".join(open_questions))
+        sections.append(
+            "Decisiones que el plan deja abiertas (resolvelas y dejá dicho qué "
+            "asumiste): " + "; ".join(open_questions)
+        )
     purpose = str(plan.get("purpose") or "")
     return "\n".join([HEADER, "", purpose, *(["", *sections] if sections else [])])
 
@@ -109,8 +117,9 @@ class OrchestrationError(UpstreamError):
 class RunOrchestrator:
     """One instance, shared. It holds no per-run state: the store does."""
 
-    def __init__(self, proxy: ProxyService, runs: RunStore, settings: OrchestrationSettings,
-                 log: RunLog) -> None:
+    def __init__(
+        self, proxy: ProxyService, runs: RunStore, settings: OrchestrationSettings, log: RunLog
+    ) -> None:
         self._proxy = proxy
         self._runs = runs
         self._settings = settings
@@ -149,8 +158,9 @@ class RunOrchestrator:
         run = (await self._runs.get(run_id)).rejected().revising()
         answer = await self._ask_pm("revise", {"plan": run.plan, "feedback": text})
         if not _is_plan(answer):
-            raise OrchestrationError(self._settings.pm_service,
-                                     "the PM did not return a revised plan")
+            raise OrchestrationError(
+                self._settings.pm_service, "the PM did not return a revised plan"
+            )
         return await self._runs.put(run.proposed(answer))
 
     async def approve(self, run_id: str) -> Run:
@@ -173,11 +183,18 @@ class RunOrchestrator:
         run = (await self._runs.get(run_id)).generating()
         await self._runs.put(run)
 
-        body = json.dumps({"question": prompt_for(run.plan or {}),
-                           "locale": self._settings.locale}).encode("utf-8")
-        stream = await self._proxy.stream(self._settings.backend_service, InboundRequest(
-            method="POST", path="api/v1/chat", body=body,
-            headers=self._agent_headers(self._settings.backend_token)))
+        body = json.dumps(
+            {"question": prompt_for(run.plan or {}), "locale": self._settings.locale}
+        ).encode("utf-8")
+        stream = await self._proxy.stream(
+            self._settings.backend_service,
+            InboundRequest(
+                method="POST",
+                path="api/v1/chat",
+                body=body,
+                headers=self._agent_headers(self._settings.backend_token),
+            ),
+        )
 
         artifact = ""
         tail = b""
@@ -219,8 +236,9 @@ class RunOrchestrator:
             # following this log have to be let go.
             self._log.end(run.id)
 
-        await self._runs.put(run.delivered(artifact) if artifact
-                             else run.failed("the agent produced no artifact"))
+        await self._runs.put(
+            run.delivered(artifact) if artifact else run.failed("the agent produced no artifact")
+        )
 
     async def read(self, run_id: str) -> Run:
         """What a reloaded tab asks for. The whole reason the state is here."""
@@ -251,10 +269,14 @@ class RunOrchestrator:
         if not self._settings.console:
             raise ConsoleDisabledError()
         artifact = await self._artifact_of(run_id)
-        return await self._open(InboundRequest(
-            method="POST", path=f"api/v1/artifacts/{artifact}/exec",
-            body=json.dumps({"command": command}).encode("utf-8"),
-            headers=self._agent_headers(self._settings.backend_token)))
+        return await self._open(
+            InboundRequest(
+                method="POST",
+                path=f"api/v1/artifacts/{artifact}/exec",
+                body=json.dumps({"command": command}).encode("utf-8"),
+                headers=self._agent_headers(self._settings.backend_token),
+            )
+        )
 
     async def open_download(self, run_id: str) -> UpstreamStream:
         """The project's ZIP, streamed from the agent with the token the browser never has.
@@ -264,9 +286,13 @@ class RunOrchestrator:
         the agent. Going through the run fixes both without the browser learning either.
         """
         artifact = await self._artifact_of(run_id)
-        return await self._open(InboundRequest(
-            method="GET", path=f"api/v1/artifacts/{artifact}/download",
-            headers=self._agent_headers(self._settings.backend_token)))
+        return await self._open(
+            InboundRequest(
+                method="GET",
+                path=f"api/v1/artifacts/{artifact}/download",
+                headers=self._agent_headers(self._settings.backend_token),
+            )
+        )
 
     async def _artifact_of(self, run_id: str) -> str:
         run = await self._runs.get(run_id)
@@ -293,22 +319,26 @@ class RunOrchestrator:
             detail = ""
         if stream.status_code == 410:
             raise ProjectGoneError()
-        raise OrchestrationError(self._settings.backend_service,
-                                 detail or f"the agent answered {stream.status_code}")
+        raise OrchestrationError(
+            self._settings.backend_service, detail or f"the agent answered {stream.status_code}"
+        )
 
     # ── the machinery ────────────────────────────────────────────────────────
 
     async def _plan(self, run: Run) -> Run:
         """One planning turn: a plan, or another questionnaire if rounds remain."""
-        answer = await self._ask_pm("plan", {
-            "idea": run.idea,
-            "answers": [{"questionId": a.question_id, "value": a.value} for a in run.answers],
-            # Told, and now true. The browser sent these and a server route destructured
-            # `{ idea, answers }` and dropped them, so the agent fell back to its own default
-            # and the cap was enforced by nothing.
-            "round": run.rounds,
-            "maxRounds": MAX_ROUNDS,
-        })
+        answer = await self._ask_pm(
+            "plan",
+            {
+                "idea": run.idea,
+                "answers": [{"questionId": a.question_id, "value": a.value} for a in run.answers],
+                # Told, and now true. The browser sent these and a server route destructured
+                # `{ idea, answers }` and dropped them, so the agent fell back to its own default
+                # and the cap was enforced by nothing.
+                "round": run.rounds,
+                "maxRounds": MAX_ROUNDS,
+            },
+        )
         if questions := _questions(answer):
             if run.rounds_left <= 0:
                 # The agent is not asked to stop asking; it is not given the tool. If one
@@ -316,31 +346,43 @@ class RunOrchestrator:
                 # difference between a policy and a hope.
                 raise OrchestrationError(
                     self._settings.pm_service,
-                    f"the PM asked for round {run.rounds + 1} of {MAX_ROUNDS}")
-            return run.asked(run.summary, {"reason": str(answer.get("reason") or ""),
-                                           "questions": questions})
+                    f"the PM asked for round {run.rounds + 1} of {MAX_ROUNDS}",
+                )
+            return run.asked(
+                run.summary, {"reason": str(answer.get("reason") or ""), "questions": questions}
+            )
         if not _is_plan(answer):
-            raise OrchestrationError(self._settings.pm_service,
-                                     "the PM returned neither a plan nor questions")
+            raise OrchestrationError(
+                self._settings.pm_service, "the PM returned neither a plan nor questions"
+            )
         return run.proposed(answer)
 
     async def _ask_pm(self, operation: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         body = json.dumps({**payload, "locale": self._settings.locale}).encode("utf-8")
-        response = await self._proxy.forward(self._settings.pm_service, InboundRequest(
-            method="POST", path=f"api/v1/{operation}", body=body,
-            headers=self._agent_headers(self._settings.pm_token)))
+        response = await self._proxy.forward(
+            self._settings.pm_service,
+            InboundRequest(
+                method="POST",
+                path=f"api/v1/{operation}",
+                body=body,
+                headers=self._agent_headers(self._settings.pm_token),
+            ),
+        )
         try:
             answer = json.loads(response.body or b"{}")
         except ValueError as error:
-            raise OrchestrationError(self._settings.pm_service,
-                                     f"{operation} did not answer JSON: {error}") from error
+            raise OrchestrationError(
+                self._settings.pm_service, f"{operation} did not answer JSON: {error}"
+            ) from error
         if response.status_code >= 400 or not isinstance(answer, dict):
             # The agent's OWN message is carried through rather than replaced. Its 503 says
             # which provider refused and why, which is the single most likely thing to go
             # wrong here and is useless as a generic "agent unavailable".
             detail = (answer.get("error") or {}).get("message") if isinstance(answer, dict) else ""
-            raise OrchestrationError(self._settings.pm_service,
-                                     str(detail or f"{operation} answered {response.status_code}"))
+            raise OrchestrationError(
+                self._settings.pm_service,
+                str(detail or f"{operation} answered {response.status_code}"),
+            )
         return answer
 
     def _agent_headers(self, token: str) -> tuple[tuple[str, str], ...]:
@@ -352,6 +394,7 @@ class RunOrchestrator:
 
 # ── reading what an agent sent ───────────────────────────────────────────────
 
+
 def _questions(answer: Any) -> list[Mapping[str, Any]]:
     """The questions in an answer, or none.
 
@@ -362,8 +405,11 @@ def _questions(answer: Any) -> list[Mapping[str, Any]]:
         return []
     nested = answer.get("questionnaire")
     source = nested if isinstance(nested, Mapping) else answer
-    return [q for q in _list(source.get("questions"))
-            if isinstance(q, Mapping) and str(q.get("text") or "").strip()]
+    return [
+        q
+        for q in _list(source.get("questions"))
+        if isinstance(q, Mapping) and str(q.get("text") or "").strip()
+    ]
 
 
 def _is_plan(answer: Any) -> bool:
@@ -374,8 +420,7 @@ def _is_plan(answer: Any) -> bool:
     """
     if not isinstance(answer, Mapping) or not str(answer.get("purpose") or "").strip():
         return False
-    return any(_items(answer.get(field))
-               for field in ("entities", "roles", "flows", "constraints"))
+    return any(_items(answer.get(field)) for field in ("entities", "roles", "flows", "constraints"))
 
 
 ARTIFACT_ID = re.compile(rb"\b([0-9a-f]{24})\b")

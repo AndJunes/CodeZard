@@ -86,13 +86,19 @@ TRANSITIONS: Mapping[RunState, Mapping[RunEvent, RunState]] = {
     RunState.IDEA: {RunEvent.DESCRIBE: RunState.PM_ANALYSIS},
     # The PM may ask again after reading the answers: a second round is a normal outcome, not
     # a failure. That is why ASK loops back.
-    RunState.PM_ANALYSIS: {RunEvent.ASK: RunState.QUESTIONNAIRE,
-                           RunEvent.PROPOSE: RunState.PLAN_REVIEW},
-    RunState.QUESTIONNAIRE: {RunEvent.DESCRIBE: RunState.PM_ANALYSIS,
-                             RunEvent.ASK: RunState.QUESTIONNAIRE,
-                             RunEvent.PROPOSE: RunState.PLAN_REVIEW},
-    RunState.PLAN_REVIEW: {RunEvent.REJECT: RunState.PLAN_REJECTED,
-                           RunEvent.APPROVE: RunState.PLAN_APPROVED},
+    RunState.PM_ANALYSIS: {
+        RunEvent.ASK: RunState.QUESTIONNAIRE,
+        RunEvent.PROPOSE: RunState.PLAN_REVIEW,
+    },
+    RunState.QUESTIONNAIRE: {
+        RunEvent.DESCRIBE: RunState.PM_ANALYSIS,
+        RunEvent.ASK: RunState.QUESTIONNAIRE,
+        RunEvent.PROPOSE: RunState.PLAN_REVIEW,
+    },
+    RunState.PLAN_REVIEW: {
+        RunEvent.REJECT: RunState.PLAN_REJECTED,
+        RunEvent.APPROVE: RunState.PLAN_APPROVED,
+    },
     RunState.PLAN_REJECTED: {RunEvent.REVISE: RunState.PM_REVISION},
     RunState.PM_REVISION: {RunEvent.PROPOSE: RunState.PLAN_REVIEW},
     # No way back. Once approved the plan is frozen for this run: CA-08.
@@ -177,8 +183,12 @@ class Run:
 
     def asked(self, summary: str, questionnaire: Mapping[str, Any]) -> Run:
         """A questionnaire was served. This is the ONLY place `rounds` grows."""
-        return self._moved(RunEvent.ASK, summary=summary or self.summary,
-                           questionnaire=questionnaire, rounds=self.rounds + 1)
+        return self._moved(
+            RunEvent.ASK,
+            summary=summary or self.summary,
+            questionnaire=questionnaire,
+            rounds=self.rounds + 1,
+        )
 
     def answering(self, answers: Sequence[Answer]) -> Run:
         """Answers are MERGED by question id, never replaced.
