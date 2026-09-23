@@ -43,7 +43,7 @@ services:
   # the probe: test with the real prompt, never with a toy one.
   mirag:
     build:
-      context: ../agente_backend
+      context: ../agente-backend
       target: base
     environment:
       MIRAG_HOST: 0.0.0.0
@@ -69,7 +69,7 @@ services:
   # would start a container that cannot run the command below.
   mirag-pm:
     build:
-      context: ../agente_backend
+      context: ../agente-backend
       target: base
     command: ["python", "-m", "mirag_pm", "serve"]
     environment:
