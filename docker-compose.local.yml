@@ -1,4 +1,4 @@
-# The gateway and the two agents it routes to, for working on the whole flow locally.
+# The gateway and the agent manager it routes to, for working on the whole flow locally.
 #
 #   cp .env.local.example .env.local && nano .env.local     # the PM needs a real key
 #   docker compose -f docker-compose.local.yml --env-file .env.local up -d --build
@@ -19,37 +19,46 @@
 name: codezard-local
 
 services:
-  # The backend agent, ONLINE.
+  # Both agents, ONE process — agente-backend/src/mirag_manager. It builds the SAME two
+  # containers `mirag serve` and `mirag-pm serve` used to build as two separate services, and
+  # answers for both behind one port: "/backend/..." is the backend agent (ONLINE — see the
+  # note this replaced, on `mirag`, below), "/pm/..." is the PM (also online: none of its three
+  # operations has a scripted double, and with the lock on it answers 502 saying exactly that).
   #
-  # It was offline here at first, and the scripted `project` demo answered every request — so
-  # the flow worked end to end and produced the same books API no matter what the plan said.
-  # That proves the plumbing and nothing else. With the lock off there is no script: the model
-  # reads the plan and writes the project.
+  # What this bought: one `depends_on`, one health check, one image build, one command. What it
+  # cost: the two agents now share a token (below) and a process environment, so their models
+  # are told apart by TWO variable names (MIRAG_BACKEND_MODEL / MIRAG_PM_MODEL) instead of by
+  # two separate `environment:` blocks — and the isolation test that used to matter most here,
+  # "the backend's token is REJECTED by the PM agent", no longer applies: one token now
+  # authenticates both. What still holds, unchanged, is the thing that test was really
+  # protecting — the PM's lexicon has every code-verb pattern permanently `(?!)` and it has no
+  # `run_code` tool, so it structurally cannot take the code branch whichever token asks it to.
   #
-  # `inclusionai/ling-3.0-flash-vl:free`, and the way that was decided matters more than the
-  # name, because free models come and go.
+  # `inclusionai/ling-3.0-flash-vl:free` for the backend, and the way that was decided matters
+  # more than the name, because free models come and go. This half has ONE requirement no model
+  # card states: it must write multi-line source inside a tool-call argument. Nineteen free
+  # models advertise tool support. Probed with a toy file, four wrote real newlines. Probed with
+  # the request this agent ACTUALLY makes — the full contract, the interface list, five files at
+  # once — three of those four returned an empty message with `finish_reason: length`. One
+  # delivered: 5 files, 288 lines. The one that failed worst is the one that used to be
+  # configured here: both nemotrons cannot emit a newline inside a tool call at all.
   #
-  # This half has ONE requirement that no model card states: it must write multi-line source
-  # inside a tool-call argument. Nineteen free models advertise tool support. Probed with a
-  # toy file, four wrote real newlines. Probed with the request this agent ACTUALLY makes —
-  # the full contract, the interface list, five files at once — three of those four returned
-  # an empty message with `finish_reason: length`: the whole output budget spent thinking,
-  # nothing emitted. One delivered: 5 files, 288 lines.
-  #
-  # The one that failed worst is the one that used to be configured here. Both nemotrons
-  # cannot emit a newline inside a tool call at all, and produced a fifteen-file project that
-  # was fifteen lines long — `import jsonimport urllib.parse` — which packaged cleanly and
-  # offered a download button. The generator now rejects that on arrival, but the lesson is
-  # the probe: test with the real prompt, never with a toy one.
-  mirag:
+  # `nvidia/nemotron-3-ultra-550b-a55b:free` for the PM: a large model, because this half is
+  # judgement over a corpus, and it has to both restate the idea and call a tool in the same
+  # turn. It stays on the PM and not on the backend: the PM writes prose and single-line
+  # strings, never source, so the newline defect that makes it useless for generation never
+  # touches it — and it plans well.
+  mirag-agents:
     build:
       context: ../agente-backend
       target: base
+    command: ["python", "-m", "mirag_manager", "serve"]
     environment:
       MIRAG_HOST: 0.0.0.0
       MIRAG_OFFLINE: "0"
       MIRAG_EXECUTION: "off"       # generates code and tests, does not run them. That is QA's.
-      MIRAG_MODEL: "${MIRAG_BACKEND_MODEL:-inclusionai/ling-3.0-flash-vl:free}"
+      MIRAG_BACKEND_MODEL: "${MIRAG_BACKEND_MODEL:-inclusionai/ling-3.0-flash-vl:free}"
+      MIRAG_PM_MODEL: "${MIRAG_PM_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}"
       MIRAG_BUDGET_USD: "${MIRAG_BUDGET_USD:-0.10}"
       # 32,000 and not 16,000, which is the model's ceiling rather than half of it.
       #
@@ -62,34 +71,6 @@ services:
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is missing}"
     networks: [interna]
 
-  # The PM agent: the SAME image, told it is a different agent.
-  #
-  # `build` rather than `image`, and that matters: the published `andreajunes/agente-backend:latest`
-  # predates this agent and does not contain the `mirag_pm` package at all. Pulling it here
-  # would start a container that cannot run the command below.
-  mirag-pm:
-    build:
-      context: ../agente-backend
-      target: base
-    command: ["python", "-m", "mirag_pm", "serve"]
-    environment:
-      MIRAG_HOST: 0.0.0.0
-      # Online, because this agent has no scripted double. Every one of its three operations
-      # needs a model, and with the lock on it answers 502 saying exactly that.
-      MIRAG_OFFLINE: "0"
-      MIRAG_EXECUTION: "off"
-      # A large one: this half is judgement over a corpus, and it has to both restate the idea
-      # and call a tool in the same turn. Nemotron stays HERE and not on the backend: the PM
-      # writes prose and single-line strings, never source, so the newline defect that makes it
-      # useless for generation does not touch it — and it plans well.
-      MIRAG_MODEL: "${MIRAG_PM_MODEL:-nvidia/nemotron-3-ultra-550b-a55b:free}"
-      MIRAG_BUDGET_USD: "${MIRAG_BUDGET_USD:-0.10}"
-      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is missing: the PM agent has no offline double}"
-      # Its own token, different from the backend's. Having two is what lets the isolation be
-      # tested rather than asserted: the backend's token must be rejected here.
-      MIRAG_TOKEN: "${MIRAG_PM_TOKEN:?MIRAG_PM_TOKEN is missing}"
-    networks: [interna]
-
   gateway:
     build:
       context: .
@@ -98,28 +79,37 @@ services:
     ports: ["127.0.0.1:8090:8000"]
     environment:
       # `health_path` is spelled out for both, and it is not optional: the gateway defaults to
-      # `/health` and these servers serve `/api/v1/health`. Without it `/health/services`
-      # reports both agents down while routing works perfectly — which is a confusing hour.
+      # `/health` and this server serves `/api/v1/health` under each agent's own prefix. Without
+      # it `/health/services` reports both agents down while routing works perfectly — which is
+      # a confusing hour.
+      #
+      # `base_url` carries the prefix now, not just the host: "backend" and "pm" are the SAME
+      # process (mirag-agents, above) on the SAME port, told apart only by "/backend" vs "/pm"
+      # in the path mirag_manager routes on. Nothing downstream of `GATEWAY_SERVICES` had to
+      # change for that — `OutboundRequest.url` was already `base_url.rstrip("/") + "/" + path`.
       #
       # `read_timeout_seconds` bounds the GAP BETWEEN CHUNKS of a streamed body, not the whole
       # download. Generation streams progress for as long as it takes; 5s would cut it off.
       GATEWAY_SERVICES: >-
-        [{"name":"backend","base_url":"http://mirag:8000","timeout_seconds":10,
+        [{"name":"backend","base_url":"http://mirag-agents:8000/backend","timeout_seconds":10,
           "read_timeout_seconds":600,"health_path":"/api/v1/health"},
-         {"name":"pm","base_url":"http://mirag-pm:8000","timeout_seconds":10,
+         {"name":"pm","base_url":"http://mirag-agents:8000/pm","timeout_seconds":10,
           "read_timeout_seconds":600,"health_path":"/api/v1/health"}]
 
       # The gateway RUNS the flow now; it does not just forward it. That is why both tokens
       # are here rather than in the front end's environment: the thing that decides is the
       # thing that has to authenticate. The front end holds GATEWAY_URL and nothing else.
+      #
+      # One value for both: `mirag-agents` is one process now, and it validates every request —
+      # whichever prefix it arrives under — against the single MIRAG_TOKEN it was started with.
       GATEWAY_ORCHESTRATION__ENABLED: "true"
-      GATEWAY_ORCHESTRATION__PM_TOKEN: "${MIRAG_PM_TOKEN:?MIRAG_PM_TOKEN is missing}"
+      GATEWAY_ORCHESTRATION__PM_TOKEN: "${MIRAG_TOKEN:?MIRAG_TOKEN is missing}"
       GATEWAY_ORCHESTRATION__BACKEND_TOKEN: "${MIRAG_TOKEN:?MIRAG_TOKEN is missing}"
       # Spanish, because the screen is. The agents default to English on their side, so
       # leaving this out is a Spanish page talking to an English agent — which reads as the
       # agent refusing to answer rather than as a locale mismatch.
       GATEWAY_ORCHESTRATION__LOCALE: "${MIRAG_LOCALE:-es}"
-    depends_on: [mirag, mirag-pm]
+    depends_on: [mirag-agents]
     networks: [interna]
 
 networks:
