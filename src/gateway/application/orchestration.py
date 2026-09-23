@@ -27,8 +27,13 @@ from typing import Any
 
 from gateway.application.proxy_service import ProxyService
 from gateway.config.settings import OrchestrationSettings
-from gateway.domain.exceptions import UpstreamError
-from gateway.domain.models import InboundRequest
+from gateway.domain.exceptions import (
+    ConsoleDisabledError,
+    NoProjectError,
+    ProjectGoneError,
+    UpstreamError,
+)
+from gateway.domain.models import InboundRequest, UpstreamStream
 from gateway.domain.ports import RunLog, RunStore
 from gateway.domain.runs import MAX_ROUNDS, Answer, IllegalTransitionError, Run
 
@@ -230,6 +235,66 @@ class RunOrchestrator:
         """
         async for chunk in self._log.follow(run_id):
             yield chunk
+
+    # ── the project, once it exists ──────────────────────────────────────────
+
+    async def open_console(self, run_id: str, command: str) -> UpstreamStream:
+        """Start a command in the run's project and hand back the agent's event stream.
+
+        The browser gets NO way to name an artifact: it names a run, and the run knows which
+        project is its own. An id in the request would let one tab run commands in another's
+        project, and the agent's token would be the only thing between them.
+
+        Two switches, and this is the first: the agent has its own (`MIRAG_CONSOLE`). The
+        gateway does not execute anything; it only decides who may ask.
+        """
+        if not self._settings.console:
+            raise ConsoleDisabledError()
+        artifact = await self._artifact_of(run_id)
+        return await self._open(InboundRequest(
+            method="POST", path=f"api/v1/artifacts/{artifact}/exec",
+            body=json.dumps({"command": command}).encode("utf-8"),
+            headers=self._agent_headers(self._settings.backend_token)))
+
+    async def open_download(self, run_id: str) -> UpstreamStream:
+        """The project's ZIP, streamed from the agent with the token the browser never has.
+
+        The agent's `download_url` is relative to the AGENT and its route is protected, so the
+        link the screen used to draw pointed at nothing: 404 at the page's own origin, 401 at
+        the agent. Going through the run fixes both without the browser learning either.
+        """
+        artifact = await self._artifact_of(run_id)
+        return await self._open(InboundRequest(
+            method="GET", path=f"api/v1/artifacts/{artifact}/download",
+            headers=self._agent_headers(self._settings.backend_token)))
+
+    async def _artifact_of(self, run_id: str) -> str:
+        run = await self._runs.get(run_id)
+        if not run.artifact_id:
+            raise NoProjectError(run_id)
+        return run.artifact_id
+
+    async def _open(self, request: InboundRequest) -> UpstreamStream:
+        """Open a stream and turn the agent's refusals into something a screen can say.
+
+        Checked BEFORE handing the stream back: a 4xx read as if it were the stream would reach
+        the browser as a 200 whose body is an error nobody is looking for.
+        """
+        stream = await self._proxy.stream(self._settings.backend_service, request)
+        if stream.status_code < 400:
+            return stream
+        try:
+            body = b"".join([chunk async for chunk in stream.chunks])[:4096]
+        finally:
+            await stream.aclose()
+        try:
+            detail = str(((json.loads(body) or {}).get("error") or {}).get("message") or "")
+        except (ValueError, AttributeError):
+            detail = ""
+        if stream.status_code == 410:
+            raise ProjectGoneError()
+        raise OrchestrationError(self._settings.backend_service,
+                                 detail or f"the agent answered {stream.status_code}")
 
     # ── the machinery ────────────────────────────────────────────────────────
 

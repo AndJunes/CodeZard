@@ -9,8 +9,11 @@ from gateway.api.schemas import ErrorDetail, ErrorResponse
 from gateway.application.orchestration import OrchestrationError
 from gateway.domain.exceptions import (
     CircuitOpenError,
+    ConsoleDisabledError,
     GatewayError,
     InstanceNotFoundError,
+    NoProjectError,
+    ProjectGoneError,
     RunNotFoundError,
     ServiceNotFoundError,
     UpstreamConnectionError,
@@ -29,6 +32,11 @@ _ERROR_STATUS: dict[type[Exception], tuple[int, str]] = {
     # state instead of by a `status` field in the body the caller sent.
     IllegalTransitionError: (status.HTTP_409_CONFLICT, "illegal_transition"),
     InstanceNotFoundError: (status.HTTP_404_NOT_FOUND, "instance_not_found"),
+    # 404: an off switch reads as a route that is not there, which is what it is.
+    ConsoleDisabledError: (status.HTTP_404_NOT_FOUND, "console_disabled"),
+    NoProjectError: (status.HTTP_409_CONFLICT, "no_project"),
+    # 410, like the agent's own: the thing existed and is gone, and asking again will not help.
+    ProjectGoneError: (status.HTTP_410_GONE, "project_gone"),
     UpstreamConnectionError: (status.HTTP_502_BAD_GATEWAY, "bad_gateway"),
     # An agent answered and what it said cannot be used — it asked past the round cap, or
     # returned a plan with nothing in it. Not a 500: nothing here failed, the machine behind

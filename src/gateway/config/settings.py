@@ -106,6 +106,12 @@ class OrchestrationSettings(BaseModel):
     pm_token: str = ""
     backend_token: str = ""
     locale: str = "es"
+    console: bool = False
+    """Let the browser run commands against a run's generated project (`POST /runs/{id}/console`).
+
+    Off by default and separate from `enabled`: orchestration talks to agents the operator chose,
+    this puts a terminal on the operator's machine. It also needs the agent's own switch
+    (`MIRAG_CONSOLE`) — the gateway only forwards, it does not execute anything itself."""
 
     # There is deliberately no timeout here. A PM call was measured at 246 seconds on a free
     # model that had to be asked twice, and it is already bounded by the service's own

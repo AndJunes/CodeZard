@@ -145,6 +145,57 @@ async def generate(run_id: str, orchestrator: OrchestratorDep) -> StreamingRespo
     )
 
 
+class ConsoleBody(BaseModel):
+    # 500 is the agent's own ceiling. Here it buys a 422 with the field named instead of a
+    # message out of the agent for something this route could have refused itself.
+    command: str = Field(min_length=1, max_length=500)
+
+
+@router.post("/{run_id}/console", summary="Run a command in the generated project")
+async def console(
+    run_id: str, body: ConsoleBody, orchestrator: OrchestratorDep
+) -> StreamingResponse:
+    """What the agent prints while the command runs, as it prints it.
+
+    The run names the project; the caller never does. Closing the request stops the command,
+    which is how the screen's "detener" works: it hangs up, the gateway closes the agent's
+    connection, and the agent kills the process tree.
+    """
+    stream = await orchestrator.open_console(run_id, body.command)
+    return StreamingResponse(
+        _relay(stream),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/{run_id}/download", summary="The generated project as a ZIP")
+async def download(run_id: str, orchestrator: OrchestratorDep) -> StreamingResponse:
+    """The file, with the agent's own name for it and its checksum."""
+    stream = await orchestrator.open_download(run_id)
+    upstream = {name.lower(): value for name, value in stream.headers}
+    kept = ("content-disposition", "content-length", "x-mirag-sha256")
+    return StreamingResponse(
+        _relay(stream),
+        media_type=upstream.get("content-type", "application/zip"),
+        headers={name: upstream[name] for name in kept if name in upstream},
+    )
+
+
+async def _relay(stream: Any) -> Any:
+    """Forward chunks as they arrive and let go of the upstream connection however this ends.
+
+    The `finally` is the whole point for the console: when the browser hangs up, this generator
+    is cancelled, and closing the stream here is what tells the agent — which is what stops
+    the process.
+    """
+    try:
+        async for chunk in stream.chunks:
+            yield chunk
+    finally:
+        await stream.aclose()
+
+
 async def _chain(first: bytes, rest: Any) -> Any:
     if first:
         yield first

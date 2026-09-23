@@ -10,6 +10,11 @@ spreads requests among them and moves on to another one when a server fails.
 Client ──► GET /api/users/items/1 ──► Gateway ──► GET http://users:8001/items/1
 ```
 
+It also **runs the CodeZard flow**: an idea goes in, a PM agent proposes a plan, a person
+approves it, and a backend agent generates the project. That lives under `/runs` and it is what
+the `codezard-front` screen talks to; see [The CodeZard flow](#the-codezard-flow-runs). To run
+it, jump to [Getting started](#getting-started).
+
 ## Features
 
 - **Transparent proxy**: method, query params, body and headers (including repeated ones such as
@@ -38,6 +43,9 @@ Client ──► GET /api/users/items/1 ──► Gateway ──► GET http://u
 - **Health checks**: `/health` (liveness) and `/health/services` (status of each microservice).
 - **Swagger / OpenAPI**: `/docs` documents the gateway's endpoints, the generic proxy and the
   agent's routes as clients call them (see [Endpoints and Swagger](#endpoints-and-swagger)).
+- **Run orchestration** (opt-in): `/runs` drives the PM and the backend agent through one
+  idea → plan → approval → project flow, holds their tokens and streams the progress (see
+  [The CodeZard flow](#the-codezard-flow-runs)).
 
 ## Architecture
 
@@ -50,7 +58,8 @@ src/gateway/
 ├── application/       # Use cases: depend only on the ports.
 │   ├── proxy_service.py
 │   ├── health_service.py
-│   └── header_policy.py
+│   ├── header_policy.py
+│   └── orchestration.py       # RunOrchestrator: the CodeZard flow behind /runs
 ├── infrastructure/    # Concrete implementations of the ports.
 │   ├── registry.py            # InMemoryServiceRegistry
 │   ├── httpx_client.py        # HttpxUpstreamClient
@@ -59,6 +68,7 @@ src/gateway/
 │       ├── circuit_breaker.py # CircuitBreakerUpstreamClient (decorator)
 │       └── retry.py           # RetryingUpstreamClient (decorator)
 ├── api/               # HTTP layer (FastAPI): routes, middleware, errors, adapters.
+│   ├── routes/        # health, the generic proxy, and runs (the CodeZard flow).
 │   ├── openapi.py     # The OpenAPI document behind Swagger UI.
 │   └── contracts/     # Routes of downstream services documented in Swagger (mirag.py).
 ├── config/settings.py # Typed configuration (pydantic-settings).
@@ -355,20 +365,50 @@ Requirements: Python 3.11+.
 
 ```bash
 python -m venv .venv
-# Windows: .venv\Scripts\activate   |   Linux/macOS: source .venv/bin/activate
+# PowerShell: .venv\Scripts\Activate.ps1   |   bash/zsh: source .venv/bin/activate
 pip install -e ".[dev]"
 
-cp .env.example .env      # then edit the list of services
+cp .env.example .env      # PowerShell: Copy-Item .env.example .env. Then set MIRAG_TOKEN
 gateway                   # or: python -m gateway
 ```
+
+Run `gateway` from the repository root: it reads `.env` from the folder it is started in. It
+listens on `0.0.0.0:8000` (`GATEWAY_HOST` / `GATEWAY_PORT`).
+
+`.env.example` is set up for the CodeZard flow: `backend` and `pm` both point at the agent
+manager on `127.0.0.1:8100`, and `MIRAG_TOKEN` must be **the same value** as in
+`agente-backend/.env`. The gateway starts even if the agents are not up, but then
+`POST /runs` answers `502` (`Service 'pm' is unreachable`) and `/health/services` reports both
+as `down`. Bring the agents up first (see below).
 
 Interactive docs (Swagger UI): <http://localhost:8000/docs>. See
 [Endpoints and Swagger](#endpoints-and-swagger).
 
+```bash
+curl http://127.0.0.1:8000/health              # the gateway itself
+curl http://127.0.0.1:8000/health/services     # every service, and whether it answers
+```
+
 ### With Docker
 
-`docker-compose.yml` starts the gateway linked to the backend agent (see
-[The backend agent](#the-backend-agent-mirag)), plus a sample microservice (`go-httpbin`). The
+There are two compose files, and they do different jobs.
+
+**`docker-compose.local.yml`: the CodeZard flow, all in containers.** It builds the agents from
+the sibling `../agente-backend` folder, runs them behind one manager, and runs the gateway with
+`/runs` switched on. Only the gateway's port is published, on `127.0.0.1:8090`.
+
+```bash
+cp .env.local.example .env.local      # OPENROUTER_API_KEY and MIRAG_TOKEN are required
+docker compose -f docker-compose.local.yml --env-file .env.local up -d --build
+curl http://127.0.0.1:8090/health/services
+```
+
+Run the screen on your machine against it: `GATEWAY_URL=http://127.0.0.1:8090 npm run dev`
+(in `codezard-front`). The console is not enabled in this file.
+
+**`docker-compose.yml`: the generic proxy.** It starts the gateway linked to the backend agent
+as a single `mirag` service (see [The backend agent](#the-backend-agent-mirag)), plus a sample
+microservice (`go-httpbin`). It does **not** switch `/runs` on, so the screen cannot use it. The
 agent must be running first, because its compose creates the network both of them share.
 
 ```bash
@@ -377,6 +417,82 @@ docker compose up --build
 curl http://localhost:8000/api/httpbin/get
 curl http://localhost:8000/health/services
 ```
+
+## The CodeZard flow (`/runs`)
+
+The gateway does not just forward this flow, it **runs** it. The screen (`codezard-front`) holds
+one variable, `GATEWAY_URL`; the decisions and the agents' tokens live here.
+
+```
+codezard-front :4321 ──► gateway :8000  /runs/*  ──► agent manager :8100
+                                                       ├─ /pm       analyze · plan · revise
+                                                       └─ /backend  chat
+```
+
+The agent manager is `agente-backend`'s `python -m mirag_manager serve`: the PM and the backend
+agent in one process, one port, one shared token. The gateway registers them as two services,
+`backend` and `pm`, that differ only in the path prefix.
+
+### Run it
+
+Three terminals, in this order (each needs the one before it):
+
+```bash
+# 1. agente-backend      (MIRAG_PORT=8100 and the same MIRAG_TOKEN in its .env)
+python -m mirag_manager serve
+
+# 2. CodeZard            (this repo)
+gateway
+
+# 3. codezard-front
+npm run dev               # open http://localhost:4321
+```
+
+The first-time setup of all three, and a table of what to check when something fails, is in
+the `codezard-front` README.
+
+### The routes
+
+Registered only when `GATEWAY_ORCHESTRATION__ENABLED=true`. Without it they do not exist, and
+the screen's "send" gets a plain `404`. Each route returns the **whole run**, except the ones
+that stream.
+
+| Method | Path | What it does |
+|---|---|---|
+| `POST` | `/runs` | Start a run from `{"idea": "..."}`. The PM analyses it |
+| `GET` | `/runs/{id}` | Read a run: what a reloaded tab asks for |
+| `POST` | `/runs/{id}/answers` | Answer the current questionnaire: `{"answers": [{"questionId", "value"}]}` |
+| `POST` | `/runs/{id}/rejection` | Reject the plan with `{"feedback": "..."}` and get the next version |
+| `POST` | `/runs/{id}/approval` | Approve the plan. No body: the act is the request |
+| `POST` | `/runs/{id}/generation` | Generate the project, as an SSE stream. `409` if the run is not approved |
+| `GET` | `/runs/{id}/events` | Replay the run's stream and keep following it (SSE). Starts nothing |
+| `POST` | `/runs/{id}/console` | Run `{"command": "..."}` (at most 500 characters) in the generated project, as an SSE stream. Closing the request stops it |
+| `GET` | `/runs/{id}/download` | The generated project as a ZIP, with its checksum in `X-Mirag-Sha256` |
+
+A run lives in the gateway's memory for one hour and is gone after a restart, by design.
+
+### Configuring the flow
+
+Environment variables (or `.env`), on top of the [general ones](#configuration):
+
+| Variable | Default | Description |
+|---|---|---|
+| `GATEWAY_ORCHESTRATION__ENABLED` | `false` | Registers `/runs`. Off, the routes do not exist |
+| `GATEWAY_ORCHESTRATION__PM_SERVICE` | `pm` | The `GATEWAY_SERVICES` entry the PM calls go to |
+| `GATEWAY_ORCHESTRATION__BACKEND_SERVICE` | `backend` | The entry the backend agent's calls go to |
+| `GATEWAY_ORCHESTRATION__PM_TOKEN` | empty | Sent to the PM as `X-Mirag-Token`. Same value as the agent's `MIRAG_TOKEN`. Empty means the agent runs open |
+| `GATEWAY_ORCHESTRATION__BACKEND_TOKEN` | empty | The same, for the backend agent |
+| `GATEWAY_ORCHESTRATION__LOCALE` | `es` | Language asked of the agents. They default to `en` on their side, so a mismatch reads as the agent refusing to answer |
+| `GATEWAY_ORCHESTRATION__CONSOLE` | `false` | Registers the console (`/runs/{id}/console`) |
+
+In `.env.example` both tokens read `MIRAG_TOKEN` (`${MIRAG_TOKEN}`), so the secret is written
+once. The two services in `GATEWAY_SERVICES` do not carry `headers`: the orchestrator attaches
+the token itself, per request.
+
+**The console needs two switches.** `GATEWAY_ORCHESTRATION__CONSOLE=true` here **and**
+`MIRAG_CONSOLE=1` in `agente-backend/.env`, then restart both. It runs whatever command the
+screen sends, on the machine that hosts the agent, in a copy of the generated project: it is
+off by default and it is not a sandbox.
 
 ## Endpoints and Swagger
 
@@ -388,8 +504,9 @@ With the gateway running:
 | <http://localhost:8000/redoc> | ReDoc: the same document, easier to read. |
 | <http://localhost:8000/openapi.json> | The OpenAPI 3.1 document, to import into Postman or a client generator. |
 
-Swagger groups the endpoints in three tags: **health**, **proxy** and **mirag**. The mirag group
-only shows up when a service named `mirag` is registered.
+Swagger groups the endpoints in tags: **health**, **proxy**, **runs** (only with orchestration
+enabled) and **mirag**. The mirag group only shows up when a service named `mirag` is
+registered.
 
 ### The gateway's own endpoints
 
@@ -401,8 +518,10 @@ only shows up when a service named `mirag` is registered.
 | same | `/api/{service}@{instance}/{path}` | The same, pinned to one instance. | Same, or `404 instance_not_found` |
 | same | `/api/{service}` | Forwarded to the root of the service. | Same |
 
-Every proxied response carries `X-Gateway-Instance`, the id of the instance that answered.
 | `GET` | `/docs`, `/redoc`, `/openapi.json` | The documentation. | `200` |
+| same | `/runs...` | The CodeZard flow. Only when `GATEWAY_ORCHESTRATION__ENABLED=true`; see [The CodeZard flow](#the-codezard-flow-runs). | See that section |
+
+Every proxied response carries `X-Gateway-Instance`, the id of the instance that answered.
 
 In Swagger, the `path` parameter of the proxy may contain `/` (`anything/1`). Swagger sends it
 encoded (`anything%2F1`) and the gateway decodes it before forwarding.
@@ -459,6 +578,7 @@ Through environment variables prefixed with `GATEWAY_` (or a `.env` file). Neste
 | Variable | Default | Description |
 |---|---|---|
 | `GATEWAY_SERVICES` | `[]` | JSON list of microservices (see below). |
+| `GATEWAY_ORCHESTRATION__*` | off | The CodeZard flow: see [The CodeZard flow](#the-codezard-flow-runs). |
 | `GATEWAY_HOST` / `GATEWAY_PORT` | `0.0.0.0` / `8000` | Listen address. |
 | `GATEWAY_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
 | `GATEWAY_MAX_CONNECTIONS` | `100` | Size of the outbound connection pool. |
@@ -479,7 +599,6 @@ Each entry in `GATEWAY_SERVICES` accepts:
     "base_url": "http://users:8001",
     "timeout_seconds": 5,
     "read_timeout_seconds": 600,
-    "health_path": "/health"
     "health_path": "/health",
     "headers": {"X-Api-Key": "..."}
   }
@@ -544,8 +663,14 @@ Browser ──► gateway /api/mirag/api/v1/chat ──(+ X-Mirag-Token)──�
 - **Timeout**: 180 s per wait. The agent can spend a whole model call (up to 60 s) between two
   events, and an answer as a whole can take minutes.
 
-To run both without Docker: start the agent with `MIRAG_PORT=8100 mirag serve` (it also defaults to
-port 8000) and use the `GATEWAY_SERVICES` line from `.env.example`.
+To use this direct proxy without Docker: start the agent alone with `MIRAG_PORT=8100 mirag serve`
+(it defaults to port 8000, the gateway's) and register it as `mirag` in `GATEWAY_SERVICES`, like
+the line under [Several agents at once](#several-agents-at-once).
+
+This is **not** how the CodeZard screen reaches the agents. The flow goes through the agent
+manager (`python -m mirag_manager serve`, which serves the PM as well) and the `backend` and `pm`
+services of [The CodeZard flow](#the-codezard-flow-runs). Running `mirag serve` there gives `404`
+on every `/pm` call.
 
 ### Several agents at once
 

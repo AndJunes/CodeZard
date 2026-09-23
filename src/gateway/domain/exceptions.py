@@ -69,3 +69,31 @@ class RunNotFoundError(GatewayError):
     def __init__(self, run_id: str) -> None:
         super().__init__("That run does not exist, or it expired")
         self.run_id = run_id
+
+
+class ConsoleDisabledError(GatewayError):
+    """The console is switched off. It runs commands on this machine, so it is opt-in."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The console is switched off on this gateway (GATEWAY_ORCHESTRATION__CONSOLE)")
+
+
+class NoProjectError(GatewayError):
+    """The run has produced nothing to run or download yet."""
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__("This run has no generated project yet")
+        self.run_id = run_id
+
+
+class ProjectGoneError(GatewayError):
+    """The run is here and the agent no longer has its project.
+
+    The agent keeps a delivered project for an hour and in memory. The run can outlive it, so
+    this is a different answer from `RunNotFoundError`: the conversation is intact and the
+    files are not.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("The agent no longer has this project (it keeps them for an hour)")
