@@ -6,7 +6,12 @@ Concrete implementations live in ``gateway.infrastructure`` and are wired in
 
 from abc import ABC, abstractmethod
 
-from gateway.domain.models import OutboundRequest, ServiceDefinition, UpstreamResponse
+from gateway.domain.models import (
+    OutboundRequest,
+    ServiceDefinition,
+    UpstreamResponse,
+    UpstreamStream,
+)
 
 
 class ServiceRegistry(ABC):
@@ -30,4 +35,16 @@ class UpstreamClient(ABC):
 
     @abstractmethod
     async def send(self, request: OutboundRequest) -> UpstreamResponse:
-        """Send ``request`` and return the downstream response."""
+        """Send ``request``, read the whole body, and return the downstream response."""
+
+    @abstractmethod
+    async def stream(self, request: OutboundRequest) -> UpstreamStream:
+        """Send ``request`` and return as soon as the status and headers arrive.
+
+        The body is left unread on an open connection, so the guarantee above only covers
+        the exchange up to the headers: a failure while the caller consumes ``chunks``
+        surfaces as whatever the transport raises, not as an ``UpstreamError``. By then the
+        client already holds a status code, so there is nothing left to translate it into.
+
+        The caller owns the returned stream and must await ``aclose``.
+        """

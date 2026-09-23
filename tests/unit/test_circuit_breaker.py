@@ -234,3 +234,32 @@ class TestCircuitBreakerUpstreamClient:
         response = await client.send(make_request(users_service))
 
         assert response is OK
+
+
+class TestStreaming:
+    async def test_failure_status_codes_count_as_failures_on_streams(
+        self, clock: FakeClock, users_service: ServiceDefinition
+    ) -> None:
+        """The verdict comes from the status code, which arrives with the headers."""
+        client = ScriptedUpstreamClient(UpstreamResponse(status_code=503))
+        guarded = CircuitBreakerUpstreamClient(
+            client, lambda: CircuitBreaker(failure_threshold=1, clock=clock)
+        )
+
+        await guarded.stream(make_request(users_service))
+
+        assert guarded.state_of("users") is CircuitState.OPEN
+
+    async def test_an_open_circuit_rejects_streams_without_reaching_the_service(
+        self, clock: FakeClock, users_service: ServiceDefinition
+    ) -> None:
+        client = ScriptedUpstreamClient(UpstreamResponse(status_code=503))
+        guarded = CircuitBreakerUpstreamClient(
+            client, lambda: CircuitBreaker(failure_threshold=1, clock=clock)
+        )
+        await guarded.stream(make_request(users_service))
+
+        with pytest.raises(CircuitOpenError):
+            await guarded.stream(make_request(users_service))
+
+        assert client.calls == 1

@@ -13,6 +13,9 @@ Client ──► GET /api/users/items/1 ──► Gateway ──► GET http://u
 
 - **Transparent proxy**: method, query params, body and headers (including repeated ones such as
   `Set-Cookie`). Strips *hop-by-hop* headers and adds `X-Forwarded-For/Proto/Host`.
+- **Streamed responses**: the body is forwarded as it arrives, not after it is complete. A service
+  that reports progress over minutes (Server-Sent Events) reaches the client as it happens, and a
+  large download is never held in memory.
 - **Retries** with exponential backoff, only for idempotent methods (`GET`, `PUT`, `DELETE`, …).
   `POST` and `PATCH` are never retried, so side effects are never duplicated.
 - **Per-service circuit breaker**: when a microservice keeps failing, the gateway stops calling it
@@ -117,12 +120,18 @@ Each entry in `GATEWAY_SERVICES` accepts:
     "name": "users",
     "base_url": "http://users:8001",
     "timeout_seconds": 5,
+    "read_timeout_seconds": 600,
     "health_path": "/health"
   }
 ]
 ```
 
 `name` is the gateway URL segment (`/api/users/...`): lowercase letters, digits, `-` and `_`.
+
+`timeout_seconds` bounds connecting, writing and waiting for a pool slot.
+`read_timeout_seconds` (optional, defaults to `timeout_seconds`) bounds the **gap between two
+chunks** of the response. They are separate because a streaming service needs a generous gap
+without also being given minutes to complete a handshake.
 
 ## Tests and quality
 
@@ -150,8 +159,13 @@ The `.github/workflows/ci.yml` workflow runs all of the above on every push and 
 
 ## Known limitations
 
-- Request and response bodies are fully loaded into memory (no *streaming*), so it is not meant
-  for uploading or downloading large files.
+- **Request** bodies are still read into memory before being forwarded; only responses stream.
+- A failure **after the first byte** cannot become a JSON error: the status line and headers are
+  already on their way, so the response ends mid-body. There is no way to un-send a `200`. The
+  cut is logged with its request id, which is what makes it diagnosable.
+- The circuit breaker judges a streamed call by its status code, which arrives with the headers.
+  A stream that dies three minutes later still counts as a success — including a HALF_OPEN probe,
+  so a service that answers and then breaks can close the circuit.
 - There is no client authentication; if the gateway is the public entry point, add it (e.g. as a
   FastAPI dependency in `api/routes/proxy.py`).
 - Circuit breaker state lives in each process's memory: with several replicas, each one keeps

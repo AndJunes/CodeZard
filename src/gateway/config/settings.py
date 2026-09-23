@@ -28,6 +28,13 @@ class ServiceSettings(BaseModel):
     base_url: HttpUrl
     timeout_seconds: PositiveFloat = 5.0
     health_path: str = "/health"
+    read_timeout_seconds: PositiveFloat | None = None
+    """Seconds allowed between two chunks of a streamed response.
+
+    Defaults to ``timeout_seconds``. A service that streams events wants this generous and
+    ``timeout_seconds`` short: the first bounds silence between events, the second bounds
+    connecting.
+    """
 
     def to_definition(self) -> ServiceDefinition:
         return ServiceDefinition(
@@ -35,6 +42,7 @@ class ServiceSettings(BaseModel):
             base_url=str(self.base_url).rstrip("/"),
             timeout_seconds=self.timeout_seconds,
             health_path=self.health_path,
+            read_timeout_seconds=self.read_timeout_seconds,
         )
 
 

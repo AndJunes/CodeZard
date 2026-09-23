@@ -1,8 +1,14 @@
 """Test doubles. They implement the same ports as production code (Liskov substitution)."""
 
 from collections import deque
+from collections.abc import AsyncIterator
 
-from gateway.domain.models import OutboundRequest, ServiceDefinition, UpstreamResponse
+from gateway.domain.models import (
+    OutboundRequest,
+    ServiceDefinition,
+    UpstreamResponse,
+    UpstreamStream,
+)
 from gateway.domain.ports import UpstreamClient
 
 Outcome = UpstreamResponse | BaseException
@@ -16,12 +22,37 @@ class ScriptedUpstreamClient(UpstreamClient):
             raise ValueError("at least one outcome is required")
         self._outcomes = deque(outcomes)
         self.requests: list[OutboundRequest] = []
+        self.closed = 0
 
     @property
     def calls(self) -> int:
         return len(self.requests)
 
     async def send(self, request: OutboundRequest) -> UpstreamResponse:
+        return self._next(request)
+
+    async def stream(self, request: OutboundRequest) -> UpstreamStream:
+        """The same script, handed over as a stream.
+
+        ``closed`` counts how many streams were closed, which is what proves the retry
+        decorator does not leak the attempts it throws away.
+        """
+        response = self._next(request)
+
+        async def chunks() -> AsyncIterator[bytes]:
+            yield response.body
+
+        async def aclose() -> None:
+            self.closed += 1
+
+        return UpstreamStream(
+            status_code=response.status_code,
+            headers=response.headers,
+            chunks=chunks(),
+            aclose=aclose,
+        )
+
+    def _next(self, request: OutboundRequest) -> UpstreamResponse:
         self.requests.append(request)
         outcome = self._outcomes.popleft() if len(self._outcomes) > 1 else self._outcomes[0]
         if isinstance(outcome, BaseException):
