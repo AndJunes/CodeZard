@@ -231,6 +231,43 @@ class SignatureVerifier(ABC):
         """Did ``address`` sign ``message``? Never raises: a malformed anything is ``False``."""
 
 
+class SubscriptionRegistry(Protocol):
+    """Where a PAID subscription really lives: the contract on Stellar.
+
+    A ``Protocol`` because the implementation talks XDR and the domain must not. ``available``
+    is ``False`` on a deployment with no contract, or with no Stellar dependency to read one
+    with, and then paid subscriptions simply are not on offer — which is a true statement
+    about that deployment rather than a silent downgrade to trusting our own table.
+    """
+
+    # Read-only, because the implementations compute them: one reads a property off a lazily
+    # loaded SDK, the other is a constant. A settable attribute here would refuse both.
+    @property
+    def available(self) -> bool: ...
+
+    @property
+    def contract_id(self) -> str: ...
+
+    def subscription(self, address: str) -> Any:
+        """What the chain says, or ``None``. Never raises for "not subscribed"."""
+
+
+class NoSubscriptions:
+    """The registry of a deployment with no contract. Answers "nobody", never raises.
+
+    A concrete class beside the port rather than in the adapter, so that the application
+    layer can default to it without importing from ``infrastructure`` — which would point the
+    dependencies the wrong way for the sake of one fallback.
+    """
+
+    available = False
+    contract_id = ""
+
+    def subscription(self, address: str) -> Any:
+        del address
+        return None
+
+
 class RunMeter(Protocol):
     """What the orchestrator needs from billing, and nothing more.
 

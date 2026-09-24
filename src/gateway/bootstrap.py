@@ -17,12 +17,14 @@ from gateway.application.proxy_service import ProxyService
 from gateway.application.x402_service import X402Service
 from gateway.config.settings import BillingSettings, Settings
 from gateway.domain.billing import Money, default_catalog
+from gateway.domain.ports import NoSubscriptions, SubscriptionRegistry
 from gateway.infrastructure.billing.sqlite_store import SqliteBillingStore
 from gateway.infrastructure.billing.stellar import (
     StellarConfig,
     StellarNetwork,
     StellarSignatures,
 )
+from gateway.infrastructure.billing.subscriptions import SubscriptionContract
 from gateway.infrastructure.httpx_client import HttpxUpstreamClient
 from gateway.infrastructure.registry import InMemoryServiceRegistry
 from gateway.infrastructure.resilience.circuit_breaker import (
@@ -136,8 +138,24 @@ def _billing(
         ),
         http_client,
     )
+    # The subscriptions contract, when there is one. `destination` doubles as the source
+    # account for the read: Soroban wants an address to simulate FROM, it signs nothing, and
+    # this is the one address the gateway is certain exists on the right network.
+    chain: SubscriptionRegistry = NoSubscriptions()
+    if settings.contract_id:
+        chain = SubscriptionContract(
+            settings.contract_id,
+            network.network,
+            source=settings.destination,
+            rpc_url=str(settings.rpc_url) if settings.rpc_url else "",
+        )
     billing = BillingService(
-        store, network, default_catalog(), settings.asset, settings.reserve_tokens
+        store,
+        network,
+        default_catalog(),
+        settings.asset,
+        settings.reserve_tokens,
+        chain=chain,
     )
     identity = IdentityService(StellarSignatures(), settings.secret.get_secret_value())
     x402 = (

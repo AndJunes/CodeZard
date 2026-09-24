@@ -52,7 +52,12 @@ from gateway.domain.billing import (
     now_utc,
     usage_of,
 )
-from gateway.domain.ports import BillingStore, PaymentNetwork
+from gateway.domain.ports import (
+    BillingStore,
+    NoSubscriptions,
+    PaymentNetwork,
+    SubscriptionRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +109,16 @@ class BillingService:
         catalog: Catalog,
         asset: str = "XLM",
         reserve: int = DEFAULT_RESERVE,
+        chain: SubscriptionRegistry | None = None,
     ) -> None:
         self._store = store
         self._network = network
         self._catalog = catalog
         self._asset = asset
         self._reserve = reserve
+        self._chain: SubscriptionRegistry = chain or NoSubscriptions()
+        """Where a PAID subscription really lives. `NoContract` answers "nobody", so a
+        deployment without one behaves as if nobody ever subscribed — which is the truth."""
 
     @property
     def catalog(self) -> Catalog:
@@ -118,6 +127,18 @@ class BillingService:
     @property
     def asset(self) -> str:
         return self._asset
+
+    @property
+    def contract_id(self) -> str:
+        """The subscriptions contract, so a browser can send its `subscribe` there. ``""``
+        when this deployment has none and paid plans are therefore not on offer."""
+        return self._chain.contract_id if self._chain.available else ""
+
+    @property
+    def destination(self) -> str:
+        """Where payments go. Public data — this process receives and never sends, so it
+        holds no key at all. ``""`` when nothing can be bought here yet."""
+        return self._network.destination
 
     @property
     def network(self) -> str:
@@ -164,6 +185,15 @@ class BillingService:
         rejected for being a fraction short of a price they never saw.
         """
         product = self._catalog.product(sku)
+        if isinstance(product, Plan) and not product.is_free and self._chain.available:
+            # Paid plans are bought by calling the contract, which takes the payment and
+            # records the period together. Selling one by invoice as well would be a second
+            # way in whose two halves can come apart — the exact failure the contract exists
+            # to remove.
+            raise BillingError(
+                f"{product.name} is subscribed to on chain, not paid by invoice: call "
+                f"subscribe() on {self._chain.contract_id}"
+            )
         if isinstance(product, Plan) and product.is_free:
             # There is nothing to pay. It is granted on sight and renews itself; selling it
             # would be an invoice for zero that can never be settled.
@@ -274,6 +304,51 @@ class BillingService:
                 subscription.renews_at.date(),
             )
 
+    # ── subscribing, which happens on chain ──────────────────────────────────
+
+    async def subscribe_transaction(self, account: str, plan_id: str) -> dict[str, Any]:
+        """The unsigned transaction that subscribes ``account`` to ``plan_id``.
+
+        The gateway says what the transaction IS; only the subscriber's key can say who
+        agrees to it, because the payment comes out of their account. Nothing here is signed
+        and nothing is charged until they send it back.
+        """
+        plan = self._catalog.plan(plan_id)
+        if plan.is_free:
+            raise BillingError(f"{plan.name} costs nothing: it is already on this account")
+        if not self._chain.available:
+            raise BillingError(
+                "this gateway has no subscriptions contract configured "
+                "(GATEWAY_BILLING__CONTRACT_ID), so plans cannot be subscribed to yet"
+            )
+        builder = getattr(self._chain, "build_subscribe", None)
+        if builder is None:  # pragma: no cover - only a double lacks it
+            raise BillingError("this subscriptions registry cannot build transactions")
+        return {
+            "plan": plan.as_json(),
+            "contract": self._chain.contract_id,
+            "network": self.network,
+            "xdr": builder(account, plan.id),
+        }
+
+    async def submit_subscription(self, account: str, signed_xdr: str) -> dict[str, Any]:
+        """Send the signed transaction, then read back what the chain now says.
+
+        Submitting here rather than from the browser: a wallet that signs and then fails to
+        send leaves somebody having authorised a payment that never happened, with no way to
+        tell. The answer comes back from the same call, and the account is settled against it
+        before it returns — so the tokens are there by the time the screen redraws.
+        """
+        submitter = getattr(self._chain, "submit", None)
+        if not self._chain.available or submitter is None:
+            raise BillingError("this gateway has no subscriptions contract configured")
+        tx_hash = submitter(signed_xdr)
+        subscription = await self.settle_period(account)
+        return {
+            "transaction": tx_hash,
+            "subscription": subscription.as_json() if subscription else None,
+        }
+
     # ── crediting and debiting ───────────────────────────────────────────────
 
     async def credit(
@@ -367,6 +442,12 @@ class BillingService:
         It is: both the grant and the expiry are keyed on the period they belong to.
         """
         now = now_utc()
+        # The chain first, and it wins. A paid subscription is recorded there in the same
+        # transaction that paid for it, so it is the thing that cannot be half-true; our own
+        # row is a mirror of it and is rewritten from it rather than argued with.
+        if mirrored := await self._mirror_chain(account, now):
+            return mirrored
+
         subscription = await self._store.subscription(account)
         if subscription is None:
             return await self._begin_free(account, now)
@@ -387,6 +468,44 @@ class BillingService:
 
         logger.info("account %s: the %s period ended", _short(account), subscription.plan_id)
         return await self._store.put_subscription(subscription.ended())
+
+    async def _mirror_chain(self, account: str, now: datetime) -> Subscription | None:
+        """Copy an ACTIVE on-chain subscription into our own row, and grant its tokens.
+
+        ``None`` when the chain has nothing live to say, which leaves the free plan below to
+        do its job. The grant is keyed on the on-chain period, so calling this on every read
+        of the account — which is what happens — credits exactly once per period paid for.
+
+        A contract that cannot be reached is logged and treated as silence rather than as
+        "not subscribed": the second would cancel a paying customer because an RPC blinked.
+        """
+        if not self._chain.available:
+            return None
+        try:
+            onchain = self._chain.subscription(account)
+        except Exception as error:
+            logger.warning("the subscriptions contract could not be read: %s", error)
+            return None
+        if onchain is None or not onchain.active(now):
+            return None
+        try:
+            plan = self._catalog.plan(onchain.plan)
+        except BillingError:
+            logger.warning(
+                "the chain reports plan %r, which this catalog does not sell", onchain.plan
+            )
+            return None
+
+        mirrored = Subscription(account, plan.id, onchain.started, onchain.expires)
+        await self._store.put_subscription(mirrored)
+        await self.credit(
+            account,
+            plan.tokens,
+            kind=EntryKind.GRANT,
+            reference=f"chain:{onchain.period_key}",
+            memo=f"{plan.name} · on-chain",
+        )
+        return mirrored
 
     async def _begin_free(self, account: str, now: datetime) -> Subscription | None:
         """Put a brand-new account on the free plan and grant its first week.

@@ -87,6 +87,14 @@ async def plans(billing: BillingDep) -> dict[str, Any]:
         "asset": billing.asset,
         "reserve": billing.reserve,
         "network": billing.network,
+        # Public on purpose: it is the address payments are made TO, it appears on every
+        # invoice, and it is on a public ledger either way. A screen that can only show it
+        # after a checkout is a screen that cannot answer "where do I send tokens to".
+        # Empty means this deployment is not selling yet, and the page says exactly that.
+        "destination": billing.destination,
+        # Where a paid plan is actually bought. Empty means this deployment has no contract,
+        # and the screen then offers only the free plan and the token packs.
+        "contract": billing.contract_id,
     }
 
 
@@ -154,6 +162,36 @@ async def checkout(body: CheckoutBody, billing: BillingDep, account: AccountDep)
     """
     invoice = await billing.checkout(account, body.sku, body.asset)
     return invoice.as_json()
+
+
+class SubscribeBody(BaseModel):
+    sku: str = Field(min_length=1, max_length=64)
+
+
+class SubmitBody(BaseModel):
+    # A prepared Soroban envelope is around 1.5 KB; four is room for a bigger footprint and a
+    # bound on what an authenticated caller can make this process decode.
+    xdr: str = Field(min_length=1, max_length=4096)
+
+
+@router.post("/subscribe", summary="The unsigned transaction that subscribes you to a plan")
+async def subscribe(
+    body: SubscribeBody, billing: BillingDep, account: AccountDep
+) -> dict[str, Any]:
+    """Nothing is signed here and nothing is charged.
+
+    The payment comes out of the subscriber's own account, so only their key can authorise
+    it. What this returns is what the transaction would do; the wallet decides whether it
+    happens.
+    """
+    return await billing.subscribe_transaction(account, body.sku)
+
+
+@router.post("/subscribe/submit", summary="Send the signed transaction")
+async def submit(body: SubmitBody, billing: BillingDep, account: AccountDep) -> dict[str, Any]:
+    """The account is settled against the chain before this returns, so the tokens are there
+    by the time the screen redraws."""
+    return await billing.submit_subscription(account, body.xdr)
 
 
 @router.get("/invoices/{invoice_id}", summary="Has it been paid?")

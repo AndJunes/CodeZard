@@ -1,0 +1,9 @@
+# Cargo's build output. Idiomatically ignored beside the crate rather than only at the repo
+# root, so the crate stays correct if it is ever moved or vendored somewhere else.
+/target
+
+# Ledger snapshots the Soroban test harness writes on every `cargo test` — 512 KB of JSON
+# describing the state each test ran against. They are a debugging aid, they are regenerated
+# whenever a test changes, and committing them would put a large, churning diff in front of
+# every review of a twelve-line contract change.
+/test_snapshots

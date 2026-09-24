@@ -176,6 +176,16 @@ class BillingSettings(BaseModel):
     x402_price_usd: str = "0.50"
     """What one unauthenticated, pay-per-call request buys, in USD of tokens."""
 
+    contract_id: str = ""
+    """The Soroban subscriptions contract. Empty means paid plans are not on offer.
+
+    A subscription is bought by calling this contract, which takes the payment and records
+    the period in one invocation — so the two cannot come apart. With no contract the free
+    plan and the token packs still work; there is simply nothing to subscribe to."""
+
+    rpc_url: HttpUrl | None = None
+    """Override the Soroban RPC. For a private instance, or a provider with a key."""
+
     facilitator: bool = False
     """Also expose ``/x402/verify`` and ``/x402/settle`` for other people's resources. Off
     unless asked for: it makes this gateway submit transactions on behalf of strangers."""
@@ -202,6 +212,10 @@ class BillingSettings(BaseModel):
             raise ValueError(
                 "billing is on but GATEWAY_BILLING__SECRET is empty: "
                 "session tokens would be forgeable by anyone"
+            )
+        if self.contract_id and not self.contract_id.startswith("C"):
+            raise ValueError(
+                "GATEWAY_BILLING__CONTRACT_ID is not a Soroban contract id (they start with C)"
             )
         if self.asset == "USDC" and not self.usdc_issuer:
             raise ValueError(

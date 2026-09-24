@@ -1,0 +1,28 @@
+[package]
+name = "codezard-subscriptions"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "CodeZard subscriptions: paying and being subscribed, in one transaction."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "23"
+
+[dev-dependencies]
+soroban-sdk = { version = "23", features = ["testutils"] }
+
+[profile.release]
+# What the Soroban docs prescribe, and every line of it is about the size of the uploaded
+# WASM: a contract is paid for by the byte, once at upload and again in every footprint.
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
