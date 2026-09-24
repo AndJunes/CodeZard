@@ -23,6 +23,9 @@ dependencies = [
 # billing — watching for a payment, quoting a price, submitting a transaction — is plain HTTP
 # against Horizon with the client that is already here. So this is an extra, and a deployment
 # without it keeps every other capability and says exactly which two it lacks.
+# The 16.1 floor is `Keypair.verify_message`, SEP-53 message verification. Sign-in is not
+# possible without it: browser wallets sign the SEP-53 hash rather than the message, so an
+# older SDK can only check the raw bytes and refuses every genuine wallet.
 stellar = ["stellar-sdk>=16.1.0"]
 dev = [
     "pytest>=8.0",

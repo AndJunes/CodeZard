@@ -414,12 +414,38 @@ class TestVerifyingASignedEnvelope:
 
 @requires_sdk
 class TestSignatures:
-    def test_a_real_signature_by_the_right_key_verifies(self) -> None:
+    def test_a_wallets_sep53_signature_verifies(self) -> None:
+        """What every browser wallet actually produces, and what sign-in used to refuse.
+
+        A wallet asked to sign a message does not sign the message: SEP-53 has it sign
+        ``SHA-256(b"Stellar Signed Message:\\n" + message)``. The gateway checked the raw
+        bytes, so every genuine wallet was told "the signature does not match that account"
+        — while the test below stayed green, because it signed the way the gateway checked
+        rather than the way a wallet signs. This is the case that was missing.
+        """
+        keypair = sdk.Keypair.random()
+        message = b"CodeZard sign-in\naccount: ...\nnonce: abc"
+        signature = base64.b64encode(keypair.sign_message(message)).decode()
+
+        assert StellarSignatures().verify(keypair.public_key, message, signature)
+
+    def test_a_raw_signature_verifies_too(self) -> None:
+        """For wallets that predate SEP-53. Both conventions prove the same thing over the
+        same challenge, and the challenge's nonce is what makes it unrepeatable."""
         keypair = sdk.Keypair.random()
         message = b"CodeZard sign-in\naccount: ...\nnonce: abc"
         signature = base64.b64encode(keypair.sign(message)).decode()
 
         assert StellarSignatures().verify(keypair.public_key, message, signature)
+
+    def test_neither_convention_saves_a_signature_by_another_key(self) -> None:
+        """Accepting two conventions must not mean giving an impostor two chances."""
+        keypair = sdk.Keypair.random()
+        stranger = sdk.Keypair.random().public_key
+        for signed in (keypair.sign_message(b"message"), keypair.sign(b"message")):
+            assert not StellarSignatures().verify(
+                stranger, b"message", base64.b64encode(signed).decode()
+            )
 
     def test_the_same_signature_under_another_key_does_not(self) -> None:
         keypair = sdk.Keypair.random()

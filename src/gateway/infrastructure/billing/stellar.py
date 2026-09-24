@@ -334,6 +334,19 @@ class StellarSignatures(SignatureVerifier):
 
         Everything is caught: a bad address, base64 that is not base64, a signature of the
         wrong length. They are all the same answer to the only question being asked.
+
+        TWO CONVENTIONS ARE ACCEPTED, and the first one is the reason sign-in ever worked:
+        a wallet asked to sign a message does not sign the message. SEP-53 has it sign
+        ``SHA-256(b"Stellar Signed Message:\\n" + message)``, so checking the raw bytes —
+        which is the obvious thing to write, and what this did — rejects every real wallet
+        with "the signature does not match that account". The second is the raw bytes, for
+        wallets that predate SEP-53.
+
+        Accepting both does not widen what a signature proves here. The bytes being checked
+        are the gateway's OWN challenge: it carries a nonce this process generated, its
+        audience and the address, so there is nowhere else a signature over that exact text
+        could have been collected. The reason SEP-53 prefixes at all — stopping a signature
+        gathered in one protocol from counting in another — is already covered by the nonce.
         """
         if self._keypair is None:
             return False
@@ -345,10 +358,16 @@ class StellarSignatures(SignatureVerifier):
         except (binascii.Error, ValueError):
             return False
         try:
-            self._keypair.from_public_key(address).verify(message, raw)
+            key = self._keypair.from_public_key(address)
         except Exception:
             return False
-        return True
+        for check in (key.verify_message, key.verify):
+            try:
+                check(message, raw)
+            except Exception:
+                continue
+            return True
+        return False
 
 
 # ── reading Horizon's JSON ───────────────────────────────────────────────────
