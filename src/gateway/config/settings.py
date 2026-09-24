@@ -106,12 +106,123 @@ class OrchestrationSettings(BaseModel):
     pm_token: str = ""
     backend_token: str = ""
     locale: str = "es"
+    console: bool = False
+    """Let the browser run commands against a run's generated project (`POST /runs/{id}/console`).
+
+    Off by default and separate from `enabled`: orchestration talks to agents the operator chose,
+    this puts a terminal on the operator's machine. It also needs the agent's own switch
+    (`MIRAG_CONSOLE`) — the gateway only forwards, it does not execute anything itself."""
 
     # There is deliberately no timeout here. A PM call was measured at 246 seconds on a free
     # model that had to be asked twice, and it is already bounded by the service's own
     # `read_timeout_seconds` — which the orchestrator reaches through the same ProxyService as
     # everything else. A second knob for the same thing is a knob that will disagree with the
     # first one.
+
+
+class BillingSettings(BaseModel):
+    """Subscriptions, token packs and x402, settled on Stellar.
+
+    Off by default, like orchestration: a gateway that is not selling anything should not
+    advertise a checkout, and one that IS must have been configured deliberately — there is
+    no combination of defaults here that starts taking money.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    enabled: bool = False
+    network: Literal["testnet", "public"] = "testnet"
+    allow_mainnet: bool = False
+    """The gate. ``network="public"`` alone is refused; this has to be set too.
+
+    Two settings for one decision, on purpose. A typo, a copied .env or an environment
+    variable inherited from somewhere else can produce `public`; producing `public` AND this
+    flag takes someone meaning it. What is on the other side is real money leaving real
+    accounts, and the agent's own blockchain layer draws the same line by not listing mainnet
+    at all."""
+
+    horizon_url: HttpUrl | None = None
+    """Override the network's default Horizon. For a private instance or a mirror."""
+
+    destination: str = ""
+    """The Stellar address payments are made to. Public data; no secret key is ever held by
+    this process — it receives, it never sends."""
+
+    asset: Literal["XLM", "USDC"] = "XLM"
+    usdc_issuer: str = ""
+    """Required when ``asset`` is USDC: an asset code without an issuer is not an asset, and
+    anyone can issue something called USDC."""
+
+    xlm_usd: str = ""
+    """Fallback XLM/USD rate, as a decimal string, for when the DEX cannot be asked. Empty
+    means "no fallback": an invoice that cannot be priced is refused rather than guessed."""
+
+    secret: SecretStr = SecretStr("")
+    """Signs session tokens. No default on purpose — a factory secret is one everybody has,
+    and here it would forge sign-ins."""
+
+    database: str = "var/billing.sqlite3"
+    """The ledger file. It is the only state in this process that must outlive it."""
+
+    reserve_tokens: PositiveInt = 50_000
+    """Tokens an account must hold before a run may start. Never debited: a floor, so a
+    generation is refused before it begins rather than halfway through."""
+
+    x402: bool = True
+    """Answer 402 with payment requirements, and accept ``X-PAYMENT``. On by default WITHIN
+    billing: a paid gateway that cannot be paid by a program is missing the cheaper half of
+    its own market, and it does nothing at all while ``enabled`` is false."""
+
+    x402_price_usd: str = "0.50"
+    """What one unauthenticated, pay-per-call request buys, in USD of tokens."""
+
+    contract_id: str = ""
+    """The Soroban subscriptions contract. Empty means paid plans are not on offer.
+
+    A subscription is bought by calling this contract, which takes the payment and records
+    the period in one invocation — so the two cannot come apart. With no contract the free
+    plan and the token packs still work; there is simply nothing to subscribe to."""
+
+    rpc_url: HttpUrl | None = None
+    """Override the Soroban RPC. For a private instance, or a provider with a key."""
+
+    facilitator: bool = False
+    """Also expose ``/x402/verify`` and ``/x402/settle`` for other people's resources. Off
+    unless asked for: it makes this gateway submit transactions on behalf of strangers."""
+
+    @model_validator(mode="after")
+    def _mainnet_is_deliberate(self) -> Self:
+        if self.network == "public" and not self.allow_mainnet:
+            raise ValueError(
+                "GATEWAY_BILLING__NETWORK=public moves real money. Set "
+                "GATEWAY_BILLING__ALLOW_MAINNET=true as well to confirm that is intended."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _sellable(self) -> Self:
+        if not self.enabled:
+            return self
+        # `destination` is NOT required here, and that is deliberate: the free plan is
+        # granted rather than sold, so a deployment can run the free tier with nothing but a
+        # secret. Requiring a Stellar address before anybody can be given five dollars a week
+        # of tokens is friction that buys nothing. Checkout and x402 refuse on their own when
+        # there is nowhere to send a payment, which is the moment it actually matters.
+        if not self.secret.get_secret_value():
+            raise ValueError(
+                "billing is on but GATEWAY_BILLING__SECRET is empty: "
+                "session tokens would be forgeable by anyone"
+            )
+        if self.contract_id and not self.contract_id.startswith("C"):
+            raise ValueError(
+                "GATEWAY_BILLING__CONTRACT_ID is not a Soroban contract id (they start with C)"
+            )
+        if self.asset == "USDC" and not self.usdc_issuer:
+            raise ValueError(
+                "asset USDC needs GATEWAY_BILLING__USDC_ISSUER: an asset code "
+                "without an issuer is not an asset"
+            )
+        return self
 
 
 class RetrySettings(BaseModel):
@@ -145,6 +256,7 @@ class Settings(BaseSettings):
     max_connections: PositiveInt = 100
     services: list[ServiceSettings] = Field(default_factory=list)
     orchestration: OrchestrationSettings = Field(default_factory=OrchestrationSettings)
+    billing: BillingSettings = Field(default_factory=BillingSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
     circuit_breaker: CircuitBreakerSettings = Field(default_factory=CircuitBreakerSettings)
 

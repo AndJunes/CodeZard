@@ -55,6 +55,7 @@ class ServiceDefinition:
         if self.read_timeout_seconds is None:
             return self.timeout_seconds
         return self.read_timeout_seconds
+
     # Sent on every request to the service (e.g. a shared secret). Kept out of repr: they
     # usually hold credentials, and a repr ends up in logs.
     headers: Headers = field(default=(), repr=False)

@@ -86,13 +86,19 @@ TRANSITIONS: Mapping[RunState, Mapping[RunEvent, RunState]] = {
     RunState.IDEA: {RunEvent.DESCRIBE: RunState.PM_ANALYSIS},
     # The PM may ask again after reading the answers: a second round is a normal outcome, not
     # a failure. That is why ASK loops back.
-    RunState.PM_ANALYSIS: {RunEvent.ASK: RunState.QUESTIONNAIRE,
-                           RunEvent.PROPOSE: RunState.PLAN_REVIEW},
-    RunState.QUESTIONNAIRE: {RunEvent.DESCRIBE: RunState.PM_ANALYSIS,
-                             RunEvent.ASK: RunState.QUESTIONNAIRE,
-                             RunEvent.PROPOSE: RunState.PLAN_REVIEW},
-    RunState.PLAN_REVIEW: {RunEvent.REJECT: RunState.PLAN_REJECTED,
-                           RunEvent.APPROVE: RunState.PLAN_APPROVED},
+    RunState.PM_ANALYSIS: {
+        RunEvent.ASK: RunState.QUESTIONNAIRE,
+        RunEvent.PROPOSE: RunState.PLAN_REVIEW,
+    },
+    RunState.QUESTIONNAIRE: {
+        RunEvent.DESCRIBE: RunState.PM_ANALYSIS,
+        RunEvent.ASK: RunState.QUESTIONNAIRE,
+        RunEvent.PROPOSE: RunState.PLAN_REVIEW,
+    },
+    RunState.PLAN_REVIEW: {
+        RunEvent.REJECT: RunState.PLAN_REJECTED,
+        RunEvent.APPROVE: RunState.PLAN_APPROVED,
+    },
     RunState.PLAN_REJECTED: {RunEvent.REVISE: RunState.PM_REVISION},
     RunState.PM_REVISION: {RunEvent.PROPOSE: RunState.PLAN_REVIEW},
     # No way back. Once approved the plan is frozen for this run: CA-08.
@@ -145,19 +151,33 @@ class Run:
     questionnaire: Mapping[str, Any] | None = None
     artifact_id: str = ""
     error: str = ""
+    account: str = ""
+    """Who pays for this run, when the gateway is charging. Empty on a gateway that is not.
+
+    Recorded at the start and never read from a later request. The alternative — taking the
+    account from whoever asks for the generation — would let one signed-in caller spend
+    another's balance by naming their run id, and a run id is not a secret strong enough to
+    be the only thing between two accounts' money."""
+    charged: int = 0
+    """Tokens debited for this run, once it finished. Zero until then, and zero forever on a
+    run that never delivered: a generation that failed after the model was paid is our loss."""
     created_at: float = field(default_factory=time.monotonic)
     updated_at: float = field(default_factory=time.monotonic)
 
     @classmethod
-    def start(cls, idea: str) -> Run:
+    def start(cls, idea: str, account: str = "") -> Run:
         text = (idea or "").strip()
         if not text:
             raise ValueError("a run needs an idea")
         if len(text) > MAX_IDEA_CHARS:
             raise ValueError(f"the idea is longer than {MAX_IDEA_CHARS} characters")
         # 16 bytes of urandom, hex: long enough that a run id is not worth guessing at, and
-        # guessing is the only way to reach someone else's — there are no accounts here.
-        return cls(id=secrets.token_hex(16), idea=text)
+        # guessing is the only way to reach someone else's when nobody is signed in.
+        return cls(id=secrets.token_hex(16), idea=text, account=account)
+
+    def billed(self, tokens: int) -> Run:
+        """What the run cost, recorded on it. Not a transition: the state is already final."""
+        return replace(self, charged=tokens, updated_at=time.monotonic())
 
     # ── moving ───────────────────────────────────────────────────────────────
 
@@ -177,8 +197,12 @@ class Run:
 
     def asked(self, summary: str, questionnaire: Mapping[str, Any]) -> Run:
         """A questionnaire was served. This is the ONLY place `rounds` grows."""
-        return self._moved(RunEvent.ASK, summary=summary or self.summary,
-                           questionnaire=questionnaire, rounds=self.rounds + 1)
+        return self._moved(
+            RunEvent.ASK,
+            summary=summary or self.summary,
+            questionnaire=questionnaire,
+            rounds=self.rounds + 1,
+        )
 
     def answering(self, answers: Sequence[Answer]) -> Run:
         """Answers are MERGED by question id, never replaced.
@@ -237,4 +261,9 @@ class Run:
             "maxRounds": MAX_ROUNDS,
             "artifactId": self.artifact_id,
             "error": self.error,
+            # The address is the account, so it is the caller's own public key coming back to
+            # them — never anybody else's, because a run is only ever read by whoever holds
+            # its id and, when billing is on, whoever the run belongs to.
+            "account": self.account,
+            "charged": self.charged,
         }

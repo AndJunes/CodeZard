@@ -39,9 +39,11 @@ import zipfile
 from io import BytesIO
 from typing import Any
 
-IDEA = ("Una API REST para gestionar reservas de salas de reunión, con CRUD completo. "
-        "Cada reserva tiene: sala, persona, fecha y hora de inicio. Solo biblioteca "
-        "estándar de Python, datos en SQLite, arquitectura por dominio.")
+IDEA = (
+    "Una API REST para gestionar reservas de salas de reunión, con CRUD completo. "
+    "Cada reserva tiene: sala, persona, fecha y hora de inicio. Solo biblioteca "
+    "estándar de Python, datos en SQLite, arquitectura por dominio."
+)
 
 ANSWERS = [
     "Una recepcionista, nadie más.",
@@ -69,12 +71,15 @@ class Flow:
 
     # ── talking to the gateway ───────────────────────────────────────────────
 
-    def call(self, path: str, method: str = "POST", body: dict | None = None,
-             timeout: int = 1800) -> tuple[int, Any]:
+    def call(
+        self, path: str, method: str = "POST", body: dict | None = None, timeout: int = 1800
+    ) -> tuple[int, Any]:
         request = urllib.request.Request(
-            f"{self.gateway}/runs{path}", method=method,
+            f"{self.gateway}/runs{path}",
+            method=method,
             data=None if body is None else json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json"},
+        )
         started = time.monotonic()
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -86,8 +91,11 @@ class Flow:
         return status, payload
 
     def stream(self, path: str, timeout: int = 1800) -> list[dict[str, Any]]:
-        request = urllib.request.Request(f"{self.gateway}/runs{path}", method="POST",
-                                         headers={"Content-Type": "application/json"})
+        request = urllib.request.Request(
+            f"{self.gateway}/runs{path}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
         events, started = [], time.monotonic()
         with urllib.request.urlopen(request, timeout=timeout) as response:
             for line in response:
@@ -99,7 +107,8 @@ class Flow:
     def download(self, artifact: str, token: str) -> bytes:
         request = urllib.request.Request(
             f"{self.gateway}/api/backend/api/v1/artifacts/{artifact}/download",
-            headers={"X-Mirag-Token": token} if token else {})
+            headers={"X-Mirag-Token": token} if token else {},
+        )
         with urllib.request.urlopen(request, timeout=120) as response:
             return response.read()
 
@@ -121,8 +130,13 @@ class Flow:
         rounds = 0
         while run.get("state") == "QUESTIONNAIRE" and rounds < 3:
             asked = (run.get("questionnaire") or {}).get("questions") or []
-            given = [{"questionId": q["id"], "value": ANSWERS[i] if i < len(ANSWERS)
-                      else "No tengo preferencia."} for i, q in enumerate(asked)]
+            given = [
+                {
+                    "questionId": q["id"],
+                    "value": ANSWERS[i] if i < len(ANSWERS) else "No tengo preferencia.",
+                }
+                for i, q in enumerate(asked)
+            ]
             status, run = self.call(f"/{run_id}/answers", body={"answers": given})
             if status != 200:
                 self.check("the plan came back", False, json.dumps(run)[:140])
@@ -138,21 +152,27 @@ class Flow:
 
         print("\n=== 5. approval ===")
         status, run = self.call(f"/{run_id}/approval", body={})
-        self.check("approval moves the run", run.get("state") == "PLAN_APPROVED",
-                   str(run.get("state")))
+        self.check(
+            "approval moves the run", run.get("state") == "PLAN_APPROVED", str(run.get("state"))
+        )
 
         print("\n=== 6. generation ===")
         events = self.stream(f"/{run_id}/generation")
         for event in events:
             if event.get("type") == "step" and _interesting(event["name"]):
-                print(f"      {event['name']:<24} {event['status']:<9} "
-                      f"{str(event.get('summary'))[:90]}")
+                print(
+                    f"      {event['name']:<24} {event['status']:<9} "
+                    f"{str(event.get('summary'))[:90]}"
+                )
 
         print("\n=== 7. what the server kept ===")
         _, run = self.call(f"/{run_id}", method="GET")
         verdict = _verdict(events)
-        self.check("the run reached ZIP_READY", run.get("state") == "ZIP_READY",
-                   f"{run.get('state')} {str(run.get('error'))[:60]}")
+        self.check(
+            "the run reached ZIP_READY",
+            run.get("state") == "ZIP_READY",
+            f"{run.get('state')} {str(run.get('error'))[:60]}",
+        )
         print(f"    verdict: {verdict or '(none)'}")
 
         print("\n=== 8. a reconnecting tab can replay it ===")
@@ -178,13 +198,16 @@ class Flow:
         lines = sum(body.count(b"\n") for body in contents.values())
         print(f"    {len(data):,} bytes · {len(names)} files · {lines} lines")
 
-        self.check("there is a README",
-                   any(n.upper().endswith("README.MD") for n in names))
-        self.check("there are tests",
-                   any("/tests/" in n or n.startswith("tests/") for n in names))
-        self.check("no file lost its line breaks",
-                   not [n for n, body in contents.items()
-                        if n.endswith(".py") and len(body) > 200 and b"\n" not in body])
+        self.check("there is a README", any(n.upper().endswith("README.MD") for n in names))
+        self.check("there are tests", any("/tests/" in n or n.startswith("tests/") for n in names))
+        self.check(
+            "no file lost its line breaks",
+            not [
+                n
+                for n, body in contents.items()
+                if n.endswith(".py") and len(body) > 200 and b"\n" not in body
+            ],
+        )
         self.check("the verdict does not reject it", verdict not in REJECTED, verdict)
 
         planned = _planned(events)
@@ -194,9 +217,23 @@ class Flow:
 
 
 def _interesting(name: str) -> bool:
-    return any(name.startswith(prefix) for prefix in (
-        "specification", "generation", "project", "plan", "structure", "syntax", "imports",
-        "tests", "crud", "repair", "packaging", "artifact"))
+    return any(
+        name.startswith(prefix)
+        for prefix in (
+            "specification",
+            "generation",
+            "project",
+            "plan",
+            "structure",
+            "syntax",
+            "imports",
+            "tests",
+            "crud",
+            "repair",
+            "packaging",
+            "artifact",
+        )
+    )
 
 
 def _verdict(events: list[dict[str, Any]]) -> str:
@@ -229,8 +266,10 @@ def main() -> int:
     except urllib.error.URLError as error:
         print(f"\nthe gateway at {args.gateway} did not answer: {error}", file=sys.stderr)
         return 2
-    print("\n" + ("ALL PASS" if not flow.failures
-                  else f"{len(flow.failures)} FAILED: {flow.failures}"))
+    print(
+        "\n"
+        + ("ALL PASS" if not flow.failures else f"{len(flow.failures)} FAILED: {flow.failures}")
+    )
     return code
 
 
