@@ -130,8 +130,6 @@ class CircuitBreakerUpstreamClient(UpstreamClient):
         request: OutboundRequest,
         call: Callable[[OutboundRequest], Awaitable[_Outcome]],
     ) -> _Outcome:
-        service_name = request.service.name
-        breaker = self._breaker_for(service_name)
         target = request.target
         breaker = self._breaker_for(target)
         if not breaker.try_acquire():
@@ -152,10 +150,8 @@ class CircuitBreakerUpstreamClient(UpstreamClient):
             breaker.on_failure()
         else:
             breaker.on_success()
-        self._log_transition(service_name, previous_state, breaker.state)
-        return outcome
         self._log_transition(target, previous_state, breaker.state)
-        return response
+        return outcome
 
     def _breaker_for(self, target: str) -> CircuitBreaker:
         if target not in self._breakers:

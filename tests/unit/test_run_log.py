@@ -67,8 +67,7 @@ class TestFollowing:
             log.end("r")
 
         writer = asyncio.create_task(later())
-        both = await asyncio.wait_for(
-            asyncio.gather(drain(log, "r"), drain(log, "r")), timeout=2)
+        both = await asyncio.wait_for(asyncio.gather(drain(log, "r"), drain(log, "r")), timeout=2)
         await writer
         assert both == [[b"a", b"b"], [b"a", b"b"]]
 

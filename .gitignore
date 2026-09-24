@@ -19,3 +19,18 @@ htmlcov/
 
 # Local compose secrets
 .env.local
+
+# Runtime state. `var/` holds the billing ledger — an append-only record of what people paid
+# and what they spent — so it is both the last thing that should be in a repository and the
+# one file on this machine that must survive a restart. The -wal and -shm files are SQLite's
+# own; they are the same data mid-write.
+var/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Rust build output for the Soroban contracts. `target/` is hundreds of megabytes of
+# recompilable artifacts; `Cargo.lock` is NOT here on purpose — a contract is built to be
+# deployed byte-for-byte, and the lock file is what makes that reproducible.
+target/
+*.wasm

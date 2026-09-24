@@ -10,15 +10,11 @@ from gateway.logging_config import request_id_var
 from tests.integration.conftest import (
     FAILURE_THRESHOLD,
     MAX_ATTEMPTS,
+    ORDERS_TOKEN,
     ChunkedBody,
     ClientConnection,
     UpstreamStub,
     http_scope,
-from tests.integration.conftest import (
-    FAILURE_THRESHOLD,
-    MAX_ATTEMPTS,
-    ORDERS_TOKEN,
-    UpstreamStub,
 )
 
 

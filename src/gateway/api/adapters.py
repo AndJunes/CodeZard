@@ -6,12 +6,9 @@ from collections.abc import AsyncIterator
 import anyio
 from fastapi import Request, Response
 from fastapi.responses import StreamingResponse
-from starlette.background import BackgroundTask
-
-from gateway.domain.models import InboundRequest, UpstreamResponse, UpstreamStream
 
 from gateway.domain.exceptions import UpstreamError
-from gateway.domain.models import ByteStream, InboundRequest, UpstreamResponse
+from gateway.domain.models import InboundRequest, UpstreamResponse, UpstreamStream
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +33,7 @@ async def to_inbound_request(request: Request, path: str) -> InboundRequest:
 def to_response(upstream: UpstreamResponse) -> Response:
     response = Response(content=upstream.body, status_code=upstream.status_code)
     _copy_headers(upstream.headers, response)
+    _copy_instance_header(upstream.instance_id, response)
     return response
 
 
@@ -46,12 +44,11 @@ def to_streaming_response(upstream: UpstreamStream) -> Response:
     response has been sent, whether the client read it all or hung up halfway. Without it
     every request would leak a connection.
     """
-    response = StreamingResponse(
-        upstream.chunks,
-        status_code=upstream.status_code,
-        background=BackgroundTask(upstream.aclose),
-    )
+    response = StreamingResponse(_relay(upstream), status_code=upstream.status_code)
+    # Prevent reverse proxies such as nginx from buffering a live stream.
+    response.headers["x-accel-buffering"] = "no"
     _copy_headers(upstream.headers, response)
+    _copy_instance_header(upstream.instance_id, response)
     return response
 
 
@@ -59,31 +56,22 @@ def _copy_headers(headers: tuple[tuple[str, str], ...], response: Response) -> N
     for name, value in headers:
         # append (not set) keeps repeated headers such as Set-Cookie.
         response.headers.append(name, value)
-    response: Response
-    if upstream.stream is None:
-        response = Response(content=upstream.body, status_code=upstream.status_code)
-    else:
-        response = StreamingResponse(_relay(upstream.stream), status_code=upstream.status_code)
-        # Tells a reverse proxy in front (nginx and the like) not to buffer the stream either.
-        response.headers["x-accel-buffering"] = "no"
-    for name, value in upstream.headers:
-        # append (not set) keeps repeated headers such as Set-Cookie.
-        response.headers.append(name, value)
-    if upstream.instance_id is not None:
+
+
+def _copy_instance_header(instance_id: str | None, response: Response) -> None:
+    if instance_id is not None:
         # Set after the service's headers, so a service cannot pass itself off as another one.
-        response.headers[INSTANCE_HEADER] = upstream.instance_id
-    return response
+        response.headers[INSTANCE_HEADER] = instance_id
 
 
-async def _relay(stream: ByteStream) -> AsyncIterator[bytes]:
+async def _relay(upstream: UpstreamStream) -> AsyncIterator[bytes]:
     try:
-        async for chunk in stream:
+        async for chunk in upstream.chunks:
             yield chunk
     except UpstreamError as exc:
         # The status line is already sent, so all that is left is to end the stream early.
         logger.warning("Stream from '%s' ended early: %s", exc.service_name, exc)
     finally:
-        # Shielded: when the client disconnects this runs inside a cancelled scope, and the
-        # upstream connection must be released anyway.
+        # A disconnected client cancels this scope; the upstream connection still must close.
         with anyio.CancelScope(shield=True):
-            await stream.aclose()
+            await upstream.aclose()

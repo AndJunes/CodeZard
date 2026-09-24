@@ -1,5 +1,7 @@
 import dataclasses
 import logging
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 from gateway.domain.exceptions import CircuitOpenError, GatewayError, UpstreamError
 from gateway.domain.models import (
@@ -7,10 +9,13 @@ from gateway.domain.models import (
     ServiceDefinition,
     ServiceInstance,
     UpstreamResponse,
+    UpstreamStream,
 )
 from gateway.domain.ports import UpstreamClient
 
 logger = logging.getLogger(__name__)
+
+_Outcome = TypeVar("_Outcome", UpstreamResponse, UpstreamStream)
 
 
 class LoadBalancingUpstreamClient(UpstreamClient):
@@ -29,13 +34,23 @@ class LoadBalancingUpstreamClient(UpstreamClient):
         self._next_turn: dict[str, int] = {}
 
     async def send(self, request: OutboundRequest) -> UpstreamResponse:
+        return await self._balanced(request, self._inner.send)
+
+    async def stream(self, request: OutboundRequest) -> UpstreamStream:
+        return await self._balanced(request, self._inner.stream)
+
+    async def _balanced(
+        self,
+        request: OutboundRequest,
+        call: Callable[[OutboundRequest], Awaitable[_Outcome]],
+    ) -> _Outcome:
         if request.instance is not None:
-            return await self._send_to(request.instance, request)
+            return await self._send_to(request.instance, request, call)
 
         errors: list[GatewayError] = []
         for instance in self._rotation(request.service):
             try:
-                return await self._send_to(instance, request)
+                return await self._send_to(instance, request, call)
             except CircuitOpenError as exc:
                 errors.append(exc)
             except UpstreamError as exc:
@@ -56,10 +71,13 @@ class LoadBalancingUpstreamClient(UpstreamClient):
         raise (tried or errors)[-1]
 
     async def _send_to(
-        self, instance: ServiceInstance, request: OutboundRequest
-    ) -> UpstreamResponse:
-        response = await self._inner.send(dataclasses.replace(request, instance=instance))
-        return dataclasses.replace(response, instance_id=instance.id)
+        self,
+        instance: ServiceInstance,
+        request: OutboundRequest,
+        call: Callable[[OutboundRequest], Awaitable[_Outcome]],
+    ) -> _Outcome:
+        outcome = await call(dataclasses.replace(request, instance=instance))
+        return dataclasses.replace(outcome, instance_id=instance.id)
 
     def _rotation(self, service: ServiceDefinition) -> tuple[ServiceInstance, ...]:
         instances = service.instances

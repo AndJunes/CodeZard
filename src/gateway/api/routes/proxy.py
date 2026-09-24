@@ -104,10 +104,7 @@ async def _forward(proxy: ProxyService, service_name: str, path: str, request: R
     paths and a guess about which one a service needs. Forwarding bytes as they arrive is
     what a proxy is supposed to do; a short body simply arrives in one chunk.
     """
-    inbound = await to_inbound_request(request, path)
-    upstream = await proxy.stream(service_name, inbound)
-    return to_streaming_response(upstream)
     name, pinned, instance_id = service_name.partition(INSTANCE_SEPARATOR)
     inbound = await to_inbound_request(request, path)
-    upstream = await proxy.forward(name, inbound, instance_id if pinned else None)
-    return to_response(upstream)
+    upstream = await proxy.stream(name, inbound, instance_id if pinned else None)
+    return to_streaming_response(upstream)

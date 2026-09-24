@@ -18,8 +18,9 @@ _RETRYABLE_ERRORS = (UpstreamConnectionError, UpstreamTimeoutError)
 _Outcome = TypeVar("_Outcome", UpstreamResponse, UpstreamStream)
 
 
-async def _discard_response(_: UpstreamResponse) -> None:
-    """A buffered response holds nothing: dropping it is free."""
+async def _discard_response(response: UpstreamResponse) -> None:
+    """Release a discarded response in case it owns a streamed body."""
+    await response.aclose()
 
 
 async def _discard_stream(stream: UpstreamStream) -> None:
@@ -107,9 +108,6 @@ class RetryingUpstreamClient(UpstreamClient):
                     return outcome
                 reason = f"status {outcome.status_code}"
                 await discard(outcome)
-                    return response
-                await response.aclose()  # discarded: free its connection before trying again
-                reason = f"status {response.status_code}"
 
             delay = self._policy.delay_for(attempt)
             logger.warning(

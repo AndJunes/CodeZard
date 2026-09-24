@@ -23,8 +23,12 @@ from gateway.infrastructure.runs import InMemoryRunStore
 
 def planned(idea: str = "a bike workshop tracker") -> Run:
     """A run parked at PLAN_REVIEW, which is where most of the interesting refusals are."""
-    return Run.start(idea).describing().asked("understood", {"questions": [{"id": "a"}]}) \
+    return (
+        Run.start(idea)
+        .describing()
+        .asked("understood", {"questions": [{"id": "a"}]})
         .proposed({"purpose": "x"})
+    )
 
 
 class TestStarting:
@@ -95,7 +99,10 @@ class TestAnswers:
         run = Run.start("x").answering([Answer("who", "volunteers"), Answer("scale", "30")])
         run = run.answering([Answer("scale", "50"), Answer("when", "Saturdays")])
         assert {a.question_id: a.value for a in run.answers} == {
-            "who": "volunteers", "scale": "50", "when": "Saturdays"}
+            "who": "volunteers",
+            "scale": "50",
+            "when": "Saturdays",
+        }
 
     def test_the_order_of_first_appearance_is_kept(self) -> None:
         run = Run.start("x").answering([Answer("a", "1"), Answer("b", "2")])

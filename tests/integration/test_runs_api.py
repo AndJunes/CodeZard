@@ -28,9 +28,13 @@ PLAN = {
 }
 QUESTIONNAIRE = {
     "summary": "A tracker for bikes, parts and volunteers.",
-    "questionnaire": {"reason": "two things are open", "questions": [
-        {"id": "who", "text": "Who uses it day to day?"},
-        {"id": "scale", "text": "How many bikes a week?"}]},
+    "questionnaire": {
+        "reason": "two things are open",
+        "questions": [
+            {"id": "who", "text": "Who uses it day to day?"},
+            {"id": "scale", "text": "How many bikes a week?"},
+        ],
+    },
 }
 ARTIFACT = "0123456789abcdef01234567"
 EVENTS = (
@@ -52,14 +56,20 @@ class Agents:
         self.requests.append(request)
         path = request.url.path
         if path.endswith("/chat"):
-            return httpx.Response(200, content=EVENTS,
-                                  headers={"content-type": "text/event-stream"})
+            return httpx.Response(
+                200, content=EVENTS, headers={"content-type": "text/event-stream"}
+            )
         if path.endswith("/analyze"):
             return httpx.Response(200, json=QUESTIONNAIRE)
         if path.endswith("/plan") and self.plan_asks_again:
             self.rounds += 1
-            return httpx.Response(200, json={"reason": "one more", "questions": [
-                {"id": f"q{self.rounds}", "text": "and this?"}]})
+            return httpx.Response(
+                200,
+                json={
+                    "reason": "one more",
+                    "questions": [{"id": f"q{self.rounds}", "text": "and this?"}],
+                },
+            )
         if path.endswith("/plan"):
             return httpx.Response(200, json=PLAN)
         return httpx.Response(200, json={**PLAN, "version": 2})
@@ -81,8 +91,7 @@ def run_settings() -> Settings:
             ServiceSettings(name="pm", base_url="http://pm.internal"),
             ServiceSettings(name="backend", base_url="http://backend.internal"),
         ],
-        orchestration={"enabled": True, "pm_token": "pm-secret",
-                       "backend_token": "backend-secret"},
+        orchestration={"enabled": True, "pm_token": "pm-secret", "backend_token": "backend-secret"},
         retry=RetrySettings(max_attempts=1, base_delay_seconds=0),
     )
 
@@ -99,8 +108,9 @@ def run_app(run_settings: Settings, agents: Agents) -> FastAPI:
 async def runs(run_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     async with (
         run_app.router.lifespan_context(run_app),
-        httpx.AsyncClient(transport=httpx.ASGITransport(app=run_app),
-                          base_url="http://gateway.test") as client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=run_app), base_url="http://gateway.test"
+        ) as client,
     ):
         yield client
 
@@ -113,8 +123,10 @@ async def start(runs: httpx.AsyncClient, idea: str = "a bike workshop tracker") 
 
 async def reach_plan(runs: httpx.AsyncClient) -> dict:
     run = await start(runs)
-    answered = await runs.post(f"/runs/{run['runId']}/answers",
-                               json={"answers": [{"questionId": "who", "value": "volunteers"}]})
+    answered = await runs.post(
+        f"/runs/{run['runId']}/answers",
+        json={"answers": [{"questionId": "who", "value": "volunteers"}]},
+    )
     return answered.json()
 
 
@@ -139,8 +151,9 @@ class TestTheGate:
     ) -> None:
         """The exact bypass the old design had: claim approval in the request."""
         run = await reach_plan(runs)
-        response = await runs.post(f"/runs/{run['runId']}/generation",
-                                   json={"plan": {**PLAN, "status": "approved"}})
+        response = await runs.post(
+            f"/runs/{run['runId']}/generation", json={"plan": {**PLAN, "status": "approved"}}
+        )
         assert response.status_code == 409
 
     async def test_approval_then_generation_streams(
@@ -169,8 +182,10 @@ class TestRounds:
         run = await start(runs)
         statuses = []
         for i in range(4):
-            response = await runs.post(f"/runs/{run['runId']}/answers",
-                                       json={"answers": [{"questionId": f"q{i}", "value": "y"}]})
+            response = await runs.post(
+                f"/runs/{run['runId']}/answers",
+                json={"answers": [{"questionId": f"q{i}", "value": "y"}]},
+            )
             statuses.append(response.status_code)
             if response.status_code != 200:
                 break
@@ -225,9 +240,7 @@ class TestTokens:
 
 
 class TestReplay:
-    async def test_a_finished_run_replays_its_whole_stream(
-        self, runs: httpx.AsyncClient
-    ) -> None:
+    async def test_a_finished_run_replays_its_whole_stream(self, runs: httpx.AsyncClient) -> None:
         """The reason reconnection is possible at all: the gateway kept what it forwarded."""
         run = await reach_plan(runs)
         await runs.post(f"/runs/{run['runId']}/approval")
@@ -240,9 +253,7 @@ class TestReplay:
             replayed = b"".join([chunk async for chunk in response.aiter_bytes()])
         assert replayed == first
 
-    async def test_replaying_twice_gives_the_same_thing(
-        self, runs: httpx.AsyncClient
-    ) -> None:
+    async def test_replaying_twice_gives_the_same_thing(self, runs: httpx.AsyncClient) -> None:
         """A GET that starts nothing and changes nothing, so two tabs can both watch."""
         run = await reach_plan(runs)
         await runs.post(f"/runs/{run['runId']}/approval")
@@ -273,9 +284,7 @@ class TestReplay:
 
 
 class TestReconnecting:
-    async def test_a_run_survives_the_request_that_made_it(
-        self, runs: httpx.AsyncClient
-    ) -> None:
+    async def test_a_run_survives_the_request_that_made_it(self, runs: httpx.AsyncClient) -> None:
         """The reason the state moved here at all: a reload used to lose everything."""
         run = await reach_plan(runs)
         again = await runs.get(f"/runs/{run['runId']}")
@@ -304,12 +313,14 @@ class TestValidation:
 class TestRegistration:
     async def test_the_routes_are_absent_when_orchestration_is_off(self) -> None:
         """A gateway with no agents behind it should not advertise a flow it cannot run."""
-        app = create_app(Settings(_env_file=None),
-                         http_client_factory=lambda _: httpx.AsyncClient())
+        app = create_app(
+            Settings(_env_file=None), http_client_factory=lambda _: httpx.AsyncClient()
+        )
         async with (
             app.router.lifespan_context(app),
-            httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                              base_url="http://gateway.test") as client,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://gateway.test"
+            ) as client,
         ):
             assert (await client.post("/runs", json={"idea": "x"})).status_code == 404
 

@@ -11,9 +11,8 @@ from gateway import __version__
 from gateway.api.contracts import CONTRACTS
 from gateway.api.errors import register_error_handlers
 from gateway.api.middleware import RequestContextMiddleware
-from gateway.api.routes import health, proxy, runs
 from gateway.api.openapi import API_DESCRIPTION, TAGS, install_openapi
-from gateway.api.routes import health, proxy
+from gateway.api.routes import billing, health, proxy, runs, x402
 from gateway.bootstrap import build_container, default_http_client
 from gateway.config.settings import Settings, get_settings
 from gateway.logging_config import configure_logging
@@ -33,9 +32,29 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         async with http_client_factory(settings) as http_client:
-            app.state.container = build_container(settings, http_client)
+            container = build_container(settings, http_client)
+            app.state.container = container
             logger.info("Gateway ready. Registered services: %s", _describe_services(settings))
-            yield
+            if container.billing is not None:
+                # "paying to …" with nothing in front of it is what an empty destination used
+                # to print. A gateway with no destination is a legitimate state — the free
+                # plan needs none — so it says which state it is in.
+                logger.info(
+                    "Billing is on: %s, ledger at %s, paying to %s",
+                    settings.billing.network,
+                    settings.billing.database,
+                    settings.billing.destination[:8] + "…"
+                    if settings.billing.destination
+                    else "nowhere yet (free plan only; set GATEWAY_BILLING__DESTINATION to sell)",
+                )
+            try:
+                yield
+            finally:
+                # The ledger holds a file handle and a WAL. Closing it is the difference
+                # between a clean shutdown and one that leaves `-wal` files behind for the
+                # next start to recover from.
+                if container.store is not None:
+                    container.store.close()
 
     app = FastAPI(
         title=settings.app_name,
@@ -53,8 +72,19 @@ def create_app(
     if settings.orchestration.enabled:
         app.include_router(runs.router)
         if not (settings.orchestration.pm_token and settings.orchestration.backend_token):
-            logger.warning("Orchestration is on and at least one agent token is empty: "
-                           "the agents behind this gateway are open to whoever reaches them.")
+            logger.warning(
+                "Orchestration is on and at least one agent token is empty: "
+                "the agents behind this gateway are open to whoever reaches them."
+            )
+    # Same rule as `/runs`: before the catch-all, and only when there is something behind it.
+    # A gateway that sells nothing should not answer a checkout, and one that cannot verify a
+    # signature should not offer a sign-in that would have to fail.
+    if settings.billing.enabled:
+        app.include_router(billing.router)
+        if settings.billing.x402:
+            app.include_router(x402.router)
+        if settings.billing.network == "public":
+            logger.warning("Billing is pointed at Stellar MAINNET: payments move real money.")
     app.include_router(proxy.router)
     install_openapi(app, (service.name for service in settings.services), CONTRACTS)
     return app

@@ -19,6 +19,7 @@ from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from gateway.api.payment_gate import PayerDep
 from gateway.application.orchestration import RunOrchestrator
 from gateway.bootstrap import Container
 from gateway.domain.runs import MAX_IDEA_CHARS, Answer
@@ -57,8 +58,18 @@ class RejectBody(BaseModel):
 
 
 @router.post("", summary="Start a run from an idea")
-async def start(body: StartBody, orchestrator: OrchestratorDep) -> dict[str, Any]:
-    run = await orchestrator.start(body.idea)
+async def start(body: StartBody, orchestrator: OrchestratorDep, payer: PayerDep) -> dict[str, Any]:
+    """The one route that decides who pays, because it is the one that starts spending.
+
+    ``payer`` is ``""`` on a gateway that is not charging, and everything below behaves as it
+    always did. When it is charging, this dependency has already refused with a 402 — and a
+    price — if the caller has neither a session with a balance nor a payment.
+
+    Nothing further down asks again: the account is written onto the run at this moment and
+    read from there. Taking it from whoever later asks for the generation would let one
+    signed-in caller spend another's balance by naming their run id.
+    """
+    run = await orchestrator.start(body.idea, payer)
     return run.as_json()
 
 
@@ -76,7 +87,8 @@ async def read(run_id: str, orchestrator: OrchestratorDep) -> dict[str, Any]:
 @router.post("/{run_id}/answers", summary="Answer the current questionnaire")
 async def answer(run_id: str, body: AnswersBody, orchestrator: OrchestratorDep) -> dict[str, Any]:
     run = await orchestrator.answer(
-        run_id, [Answer(question_id=a.questionId, value=a.value) for a in body.answers])
+        run_id, [Answer(question_id=a.questionId, value=a.value) for a in body.answers]
+    )
     return run.as_json()
 
 
@@ -87,8 +99,9 @@ async def reject(run_id: str, body: RejectBody, orchestrator: OrchestratorDep) -
 
 
 @router.post("/{run_id}/approval", summary="Approve the plan")
-async def approve(run_id: str, orchestrator: OrchestratorDep,
-                  _: Annotated[dict[str, Any] | None, Body()] = None) -> dict[str, Any]:
+async def approve(
+    run_id: str, orchestrator: OrchestratorDep, _: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
     """The gate, and it takes no body ON PURPOSE.
 
     There is nothing for the caller to say here. The old design had the browser set
@@ -143,6 +156,57 @@ async def generate(run_id: str, orchestrator: OrchestratorDep) -> StreamingRespo
             "X-Accel-Buffering": "no",
         },
     )
+
+
+class ConsoleBody(BaseModel):
+    # 500 is the agent's own ceiling. Here it buys a 422 with the field named instead of a
+    # message out of the agent for something this route could have refused itself.
+    command: str = Field(min_length=1, max_length=500)
+
+
+@router.post("/{run_id}/console", summary="Run a command in the generated project")
+async def console(
+    run_id: str, body: ConsoleBody, orchestrator: OrchestratorDep
+) -> StreamingResponse:
+    """What the agent prints while the command runs, as it prints it.
+
+    The run names the project; the caller never does. Closing the request stops the command,
+    which is how the screen's "detener" works: it hangs up, the gateway closes the agent's
+    connection, and the agent kills the process tree.
+    """
+    stream = await orchestrator.open_console(run_id, body.command)
+    return StreamingResponse(
+        _relay(stream),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/{run_id}/download", summary="The generated project as a ZIP")
+async def download(run_id: str, orchestrator: OrchestratorDep) -> StreamingResponse:
+    """The file, with the agent's own name for it and its checksum."""
+    stream = await orchestrator.open_download(run_id)
+    upstream = {name.lower(): value for name, value in stream.headers}
+    kept = ("content-disposition", "content-length", "x-mirag-sha256")
+    return StreamingResponse(
+        _relay(stream),
+        media_type=upstream.get("content-type", "application/zip"),
+        headers={name: upstream[name] for name in kept if name in upstream},
+    )
+
+
+async def _relay(stream: Any) -> Any:
+    """Forward chunks as they arrive and let go of the upstream connection however this ends.
+
+    The `finally` is the whole point for the console: when the browser hangs up, this generator
+    is cancelled, and closing the stream here is what tells the agent — which is what stops
+    the process.
+    """
+    try:
+        async for chunk in stream.chunks:
+            yield chunk
+    finally:
+        await stream.aclose()
 
 
 async def _chain(first: bytes, rest: Any) -> Any:
