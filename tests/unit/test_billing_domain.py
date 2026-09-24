@@ -6,9 +6,13 @@ from decimal import Decimal
 import pytest
 
 from gateway.domain.billing import (
+    FREE_PLAN_ID,
+    FREE_WEEKLY_VALUE,
     MONTH,
+    WEEK,
     Balance,
     BillingError,
+    Cadence,
     Catalog,
     EntryKind,
     Invoice,
@@ -214,6 +218,20 @@ class TestBalance:
     def test_it_never_goes_below_zero(self) -> None:
         assert balance_of(ACCOUNT, [entry(EntryKind.USAGE, -900)]).total == 0
 
+    def test_an_overspend_is_not_forgiven_by_the_next_period_s_grant(self) -> None:
+        """A run is only ever authorised against a balance, so the one way to overshoot is a
+        single run costing more than was left. If the next grant did not absorb that, the
+        free plan would make overshooting free money, once a week, forever."""
+        balance = balance_of(
+            ACCOUNT, [entry(EntryKind.USAGE, -1_200), entry(EntryKind.GRANT, 1_000)]
+        )
+        assert balance.total == 0
+
+        partly = balance_of(
+            ACCOUNT, [entry(EntryKind.USAGE, -400, "a"), entry(EntryKind.GRANT, 1_000, "b")]
+        )
+        assert partly.total == 600
+
     def test_an_overspend_is_carried_and_not_forgiven_by_topping_up(self) -> None:
         """Charging happens after the work, so a run CAN take an account past zero. The
         clamp is only on the answer — the debt is still in the sum, and the next purchase
@@ -243,13 +261,43 @@ class TestCatalog:
             default_catalog().plan("tokens-1m")
 
     def test_the_shipped_catalog_sells_nothing_for_nothing(self) -> None:
-        """A catalog of zeroes looks configured and gives the product away."""
+        """A catalog of zeroes looks configured and gives the product away.
+
+        The free plan is the one deliberate exception, and it is checked separately below:
+        it costs nothing ON PURPOSE, which is exactly why every other line must not.
+        """
         catalog = default_catalog()
         assert catalog.plans
         assert catalog.packs
         for product in (*catalog.plans, *catalog.packs):
-            assert product.price.micros > 0, product.id
             assert product.tokens > 0, product.id
+            if getattr(product, "is_free", False):
+                continue
+            assert product.price.micros > 0, product.id
+
+    def test_there_is_exactly_one_free_plan_and_it_is_weekly(self) -> None:
+        free = [plan for plan in default_catalog().plans if plan.is_free]
+        assert len(free) == 1
+        assert free[0].id == FREE_PLAN_ID
+        assert free[0].cadence is Cadence.WEEKLY
+        assert free[0].period == WEEK
+
+    def test_the_free_plan_is_worth_what_it_promises(self) -> None:
+        """Five dollars a week, derived from the price of a token rather than written twice.
+
+        Change `per_million` and the free tier stays worth five dollars, which is the promise
+        that was made — a hard-coded token count would quietly become a different promise.
+        """
+        pricing = Pricing(per_million=Money.parse("6.00"))
+        free = default_catalog(pricing).plan(FREE_PLAN_ID)
+        assert free.tokens == pricing.tokens_for(FREE_WEEKLY_VALUE)
+        assert pricing.cost_of(free.tokens) <= FREE_WEEKLY_VALUE
+
+    def test_a_dearer_token_makes_the_free_plan_smaller_not_cheaper(self) -> None:
+        cheap = default_catalog(Pricing(per_million=Money.parse("3.00"))).plan(FREE_PLAN_ID)
+        dear = default_catalog(Pricing(per_million=Money.parse("12.00"))).plan(FREE_PLAN_ID)
+        assert cheap.tokens > dear.tokens
+        assert cheap.price == dear.price == Money()
 
     def test_it_serialises_without_losing_the_price(self) -> None:
         body = Catalog(plans=(Plan("p", "P", Money.usd(9), 1_000),)).as_json()
@@ -274,9 +322,24 @@ class TestSubscription:
     def test_renewing_starts_a_fresh_period(self) -> None:
         plan = Plan("p", "P", Money.usd(19), 1_000)
         later = NOW + timedelta(days=35)
-        renewed = Subscription.begin(ACCOUNT, plan, NOW).renewed(later)
+        renewed = Subscription.begin(ACCOUNT, plan, NOW).renewed(plan, later)
         assert renewed.renews_at == later + MONTH
         assert renewed.status is SubscriptionStatus.ACTIVE
+
+    def test_a_weekly_plan_renews_in_a_week(self) -> None:
+        """The plan owns how long a period is; the subscription asks it."""
+        weekly = Plan("free", "Free", Money(), 1_000, cadence=Cadence.WEEKLY)
+        subscription = Subscription.begin(ACCOUNT, weekly, NOW)
+        assert subscription.renews_at == NOW + WEEK
+        assert subscription.renewed(weekly, NOW + WEEK).renews_at == NOW + WEEK + WEEK
+
+    def test_a_period_names_itself_so_its_grant_lands_once(self) -> None:
+        """Settling happens on every read of the account. Without a key per period, the free
+        plan would grant tokens on every page load."""
+        weekly = Plan("free", "Free", Money(), 1_000, cadence=Cadence.WEEKLY)
+        first = Subscription.begin(ACCOUNT, weekly, NOW)
+        assert first.period_key == first.period_key
+        assert first.renewed(weekly, NOW + WEEK).period_key != first.period_key
 
     def test_a_cancelled_subscription_is_neither_active_nor_due(self) -> None:
         plan = Plan("p", "P", Money.usd(19), 1_000)

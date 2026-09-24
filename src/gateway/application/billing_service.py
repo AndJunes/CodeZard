@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from gateway.domain.billing import (
@@ -43,12 +44,13 @@ from gateway.domain.billing import (
     Pack,
     Plan,
     Subscription,
-    SubscriptionStatus,
     Usage,
+    UsageSummary,
     balance_of,
     entry_id,
     new_invoice_id,
     now_utc,
+    usage_of,
 )
 from gateway.domain.ports import BillingStore, PaymentNetwork
 
@@ -72,6 +74,13 @@ class AccountView:
     subscription: Subscription | None
     plan: Plan | None
     entries: Sequence[LedgerEntry]
+    usage: UsageSummary = field(default_factory=UsageSummary)
+    """What has been spent in the CURRENT period, not since the beginning of time.
+
+    A lifetime total answers a question nobody asks. What a person wants to know is how much
+    of this week's grant is gone, which is only meaningful against the window it belongs to —
+    so the summary carries its own `since`."""
+    lifetime: UsageSummary = field(default_factory=UsageSummary)
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -79,6 +88,8 @@ class AccountView:
             "balance": self.balance.as_json(),
             "subscription": self.subscription.as_json() if self.subscription else None,
             "plan": self.plan.as_json() if self.plan else None,
+            "usage": self.usage.as_json(),
+            "lifetime": self.lifetime.as_json(),
             "entries": [entry.as_json() for entry in self.entries],
         }
 
@@ -109,6 +120,12 @@ class BillingService:
         return self._asset
 
     @property
+    def network(self) -> str:
+        """The x402 network identifier — `stellar-testnet` or `stellar`. The browser needs it
+        to tell its wallet which Stellar to sign for."""
+        return self._network.network
+
+    @property
     def reserve(self) -> int:
         return self._reserve
 
@@ -119,15 +136,17 @@ class BillingService:
         return balance_of(account, await self._store.all_entries(account))
 
     async def view(self, account: str, entries: int = 50) -> AccountView:
-        await self.expire_if_due(account)
-        subscription = await self._store.subscription(account)
+        subscription = await self.settle_period(account)
         plan = None
         if subscription is not None:
             try:
                 plan = self._catalog.plan(subscription.plan_id)
             except BillingError:  # a plan withdrawn from the catalog: the row still stands
                 plan = None
+        history = await self._store.all_entries(account)
         return AccountView(
+            usage=usage_of(history, subscription.started_at if subscription else None),
+            lifetime=usage_of(history),
             account=account,
             balance=await self.balance(account),
             subscription=subscription,
@@ -145,6 +164,15 @@ class BillingService:
         rejected for being a fraction short of a price they never saw.
         """
         product = self._catalog.product(sku)
+        if isinstance(product, Plan) and product.is_free:
+            # There is nothing to pay. It is granted on sight and renews itself; selling it
+            # would be an invoice for zero that can never be settled.
+            raise BillingError(f"{product.name} costs nothing: it is already on this account")
+        if not self._network.destination:
+            raise BillingError(
+                "this gateway has no payment destination configured "
+                "(GATEWAY_BILLING__DESTINATION), so nothing can be bought here yet"
+            )
         asset = (asset or self._asset).upper()
         now = now_utc()
         invoice = Invoice(
@@ -234,7 +262,7 @@ class BillingService:
             now = now_utc()
             current = await self._store.subscription(invoice.account)
             subscription = (
-                current.renewed(now)
+                current.renewed(product, now)
                 if current is not None and current.plan_id == product.id
                 else Subscription.begin(invoice.account, product, now)
             )
@@ -279,7 +307,7 @@ class BillingService:
 
         The only place billing can say no, and it says it before anything is generated.
         """
-        await self.expire_if_due(account)
+        await self.settle_period(account)
         balance = await self.balance(account)
         required = max(needed, self._reserve)
         if not balance.can_afford(required):
@@ -313,42 +341,97 @@ class BillingService:
 
     # ── periods ──────────────────────────────────────────────────────────────
 
-    async def expire_if_due(self, account: str) -> Subscription | None:
-        """End a period whose time is up, and take back what it granted.
+    @property
+    def free_plan(self) -> Plan | None:
+        """The plan every account starts on, or ``None`` if this catalog has none."""
+        return next((plan for plan in self._catalog.plans if plan.is_free), None)
 
-        Granted tokens do not roll over, and this is where that is enforced — by writing an
-        EXPIRY entry for exactly what is left, not by resetting a counter. The balance stays
-        a sum of rows, and a person can see the day their grant ended and how much of it they
-        had not used.
+    async def settle_period(self, account: str) -> Subscription | None:
+        """Bring the account's period up to date, and start the free one if it has none.
 
-        There is no auto-renewal: nothing here holds a card, and a Stellar payment cannot be
-        pulled. The next period starts when the next invoice is paid.
+        Three things happen here and they are one decision, which is why they are one method:
+
+        - **No subscription at all** → the free plan begins. Every account has one from the
+          moment it is first seen; there is nothing to buy and nothing to accept.
+        - **A free period that is over** → it renews itself, and the next week is granted.
+          Paid plans cannot do this — nothing here holds a card and a Stellar payment cannot
+          be pulled — but a grant of nothing can be given again.
+        - **A paid period that is over** → it ends, and what it granted is taken back. The
+          next period starts when the next invoice is paid.
+
+        Granted tokens never roll over, and that is enforced by writing an EXPIRY row for
+        exactly what is left rather than by resetting a counter: the balance stays a sum of
+        rows, and a person can see the day their grant ended and how much they had not used.
+
+        Called on every read of the account and before every run, so it has to be idempotent.
+        It is: both the grant and the expiry are keyed on the period they belong to.
         """
+        now = now_utc()
         subscription = await self._store.subscription(account)
-        if subscription is None or not subscription.due(now_utc()):
+        if subscription is None:
+            return await self._begin_free(account, now)
+        if not subscription.due(now):
             return subscription
-        balance = await self.balance(account)
-        if balance.granted > 0:
-            await self._store.append(
-                LedgerEntry(
-                    id=entry_id(),
-                    account=account,
-                    kind=EntryKind.EXPIRY,
-                    tokens=-balance.granted,
-                    at=now_utc(),
-                    reference=f"expiry:{subscription.plan_id}:{subscription.renews_at.isoformat()}",
-                    memo="the subscription period ended",
-                )
-            )
-        ended = Subscription(
-            subscription.account,
-            subscription.plan_id,
-            subscription.started_at,
-            subscription.renews_at,
-            SubscriptionStatus.EXPIRED,
-        )
+
+        try:
+            plan = self._catalog.plan(subscription.plan_id)
+        except BillingError:  # withdrawn from the catalog: end it, there is nothing to renew
+            plan = None
+
+        await self._expire_grant(account, subscription, now)
+        if plan is not None and plan.is_free:
+            renewed = await self._store.put_subscription(subscription.renewed(plan, now))
+            await self._grant(account, plan, renewed)
+            logger.info("account %s: the free week renewed", _short(account))
+            return renewed
+
         logger.info("account %s: the %s period ended", _short(account), subscription.plan_id)
-        return await self._store.put_subscription(ended)
+        return await self._store.put_subscription(subscription.ended())
+
+    async def _begin_free(self, account: str, now: datetime) -> Subscription | None:
+        """Put a brand-new account on the free plan and grant its first week.
+
+        NOTE, because it is a real exposure and not a detail: an account here is a Stellar
+        address, and addresses are free to generate. Nothing in this stops somebody minting a
+        thousand keypairs and collecting a thousand free weeks. What would stop it is
+        requiring the address to EXIST on the ledger — which on Stellar costs a base reserve,
+        so it is a real cost rather than a captcha — and that check is deliberately not here
+        yet because it puts a Horizon call on the sign-in path. It belongs in front of this
+        method when the free tier is worth farming.
+        """
+        plan = self.free_plan
+        if plan is None:
+            return None
+        subscription = await self._store.put_subscription(Subscription.begin(account, plan, now))
+        await self._grant(account, plan, subscription)
+        logger.info("account %s starts on %s", _short(account), plan.id)
+        return subscription
+
+    async def _grant(self, account: str, plan: Plan, subscription: Subscription) -> None:
+        """This period's tokens. Keyed on the period, so it lands exactly once."""
+        await self.credit(
+            account,
+            plan.tokens,
+            kind=EntryKind.GRANT,
+            reference=f"grant:{subscription.period_key}",
+            memo=f"{plan.name} · {plan.cadence.value}",
+        )
+
+    async def _expire_grant(self, account: str, subscription: Subscription, now: datetime) -> None:
+        balance = await self.balance(account)
+        if balance.granted <= 0:
+            return
+        await self._store.append(
+            LedgerEntry(
+                id=entry_id(),
+                account=account,
+                kind=EntryKind.EXPIRY,
+                tokens=-balance.granted,
+                at=now,
+                reference=f"expiry:{subscription.period_key}",
+                memo="the period ended and its tokens did not roll over",
+            )
+        )
 
     # ── helpers the API layer needs ──────────────────────────────────────────
 

@@ -36,11 +36,16 @@ def create_app(
             app.state.container = container
             logger.info("Gateway ready. Registered services: %s", _describe_services(settings))
             if container.billing is not None:
+                # "paying to …" with nothing in front of it is what an empty destination used
+                # to print. A gateway with no destination is a legitimate state — the free
+                # plan needs none — so it says which state it is in.
                 logger.info(
-                    "Billing is on: %s, paying to %s, ledger at %s",
+                    "Billing is on: %s, ledger at %s, paying to %s",
                     settings.billing.network,
-                    settings.billing.destination[:8] + "…",
                     settings.billing.database,
+                    settings.billing.destination[:8] + "…"
+                    if settings.billing.destination
+                    else "nowhere yet (free plan only; set GATEWAY_BILLING__DESTINATION to sell)",
                 )
             try:
                 yield

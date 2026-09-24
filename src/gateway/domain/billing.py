@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any
 
 from gateway.domain.exceptions import GatewayError
@@ -139,8 +140,25 @@ class Money:
 
 
 class Cadence(StrEnum):
+    WEEKLY = "weekly"
     MONTHLY = "monthly"
     ONE_OFF = "one_off"
+
+
+WEEK = timedelta(days=7)
+MONTH = timedelta(days=30)
+"""A period, in the only definition that is the same length every time.
+
+Calendar months are 28 to 31 days, so pricing them identically means a February subscriber
+pays 10% more per day than a March one for the same thing. Thirty days is a period, said
+plainly, and it renews on a date arithmetic can always produce."""
+
+PERIODS: Mapping[str, timedelta] = MappingProxyType(
+    {
+        Cadence.WEEKLY.value: WEEK,
+        Cadence.MONTHLY.value: MONTH,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +175,17 @@ class Plan:
     overage: bool = True
     """May the account keep working past its grant by spending purchased tokens?"""
 
+    @property
+    def period(self) -> timedelta:
+        """How long one grant lasts. A one-off plan is a contradiction; it reads as monthly."""
+        return PERIODS.get(self.cadence.value, MONTH)
+
+    @property
+    def is_free(self) -> bool:
+        """Costs nothing, so it is granted rather than sold — and, unlike a paid plan, it can
+        renew itself. A crypto payment cannot be pulled; a grant of nothing can."""
+        return self.price.is_zero
+
     def as_json(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -165,6 +194,8 @@ class Plan:
             "price": self.price.as_json(),
             "tokens": self.tokens,
             "cadence": self.cadence.value,
+            "period_days": self.period.days,
+            "free": self.is_free,
             "description": self.description,
             "overage": self.overage,
         }
@@ -445,6 +476,15 @@ def balance_of(account: str, entries: Iterable[LedgerEntry]) -> Balance:
             from_grant = min(granted, owed)
             granted -= from_grant
             purchased -= owed - from_grant
+    # A debit that overshot both pools leaves `purchased` negative, and clamping it away on
+    # its own would FORGIVE the overspend. That matters because of the free plan: a run is
+    # only ever authorised against a balance, so the only way to overshoot is a single run
+    # costing more than was left — and if next week's grant did not absorb it, overshooting
+    # would be free money, once a week, forever. The shortfall follows the account into
+    # whatever it holds next.
+    if purchased < 0:
+        granted += purchased
+        purchased = 0
     return Balance(account, max(0, granted), max(0, purchased))
 
 
@@ -457,14 +497,6 @@ class SubscriptionStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-MONTH = timedelta(days=30)
-"""A period, in the only definition that is the same length every time.
-
-Calendar months are 28 to 31 days, so pricing them identically means a February subscriber
-pays 10% more per day than a March one for the same thing. Thirty days is a period, said
-plainly, and it renews on a date arithmetic can always produce."""
-
-
 @dataclass(frozen=True, slots=True)
 class Subscription:
     account: str
@@ -475,7 +507,7 @@ class Subscription:
 
     @classmethod
     def begin(cls, account: str, plan: Plan, now: datetime) -> Subscription:
-        return cls(account, plan.id, now, now + MONTH)
+        return cls(account, plan.id, now, now + plan.period)
 
     def is_active(self, now: datetime) -> bool:
         return self.status is SubscriptionStatus.ACTIVE and now < self.renews_at
@@ -484,13 +516,30 @@ class Subscription:
         """The period is over and the next one has not been paid for."""
         return self.status is SubscriptionStatus.ACTIVE and now >= self.renews_at
 
-    def renewed(self, now: datetime) -> Subscription:
+    def renewed(self, plan: Plan, now: datetime) -> Subscription:
+        """The next period. Takes the plan because the plan owns how long a period is."""
         return replace(
-            self, started_at=now, renews_at=now + MONTH, status=SubscriptionStatus.ACTIVE
+            self,
+            started_at=now,
+            renews_at=now + plan.period,
+            status=SubscriptionStatus.ACTIVE,
         )
+
+    def ended(self) -> Subscription:
+        return replace(self, status=SubscriptionStatus.EXPIRED)
 
     def cancelled(self) -> Subscription:
         return replace(self, status=SubscriptionStatus.CANCELLED)
+
+    @property
+    def period_key(self) -> str:
+        """Names THIS period, so a grant for it can be written exactly once.
+
+        Settling a period happens on every read of the account, which makes the reference the
+        only thing standing between "the free plan renews weekly" and "the free plan grants
+        tokens on every page load".
+        """
+        return f"{self.plan_id}:{self.renews_at.isoformat()}"
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -621,14 +670,38 @@ class ObservedPayment:
 # ── the default catalog ──────────────────────────────────────────────────────
 
 
-def default_catalog() -> Catalog:
+FREE_PLAN_ID = "free"
+
+FREE_WEEKLY_VALUE = Money.parse("5.00")
+"""What the free plan is worth every week, in money.
+
+Money and not a token count, because the token count follows from the price of a token and
+saying it twice is how the two drift apart. At the shipped rate this is 833,333 tokens; change
+`Pricing.per_million` and the free tier stays worth five dollars a week, which is the promise
+that was actually made."""
+
+
+def default_catalog(pricing: Pricing | None = None) -> Catalog:
     """What ships when a deployment has not said otherwise.
 
     Real numbers rather than placeholders, because a catalog of zeroes is one that looks
     configured and sells everything for nothing.
     """
+    pricing = pricing or Pricing()
     return Catalog(
+        pricing=pricing,
         plans=(
+            Plan(
+                FREE_PLAN_ID,
+                "Free",
+                Money(),
+                pricing.tokens_for(FREE_WEEKLY_VALUE),
+                cadence=Cadence.WEEKLY,
+                description=(
+                    f"US$ {FREE_WEEKLY_VALUE} en tokens por semana, sin pagar nada. "
+                    "Se renueva solo y no se acumula."
+                ),
+            ),
             Plan(
                 "starter",
                 "Starter",
@@ -659,6 +732,51 @@ def default_catalog() -> Catalog:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class UsageSummary:
+    """What an account has actually spent, and on how many runs.
+
+    Derived from the ledger like everything else here — it is the USAGE rows added up, not a
+    counter kept somewhere. `since` is what the window means, so a screen can say "this week"
+    rather than leaving a number to be read as a lifetime total.
+    """
+
+    tokens: int = 0
+    runs: int = 0
+    cost: Money = field(default_factory=Money)
+    """What those runs cost US, at the provider. Zero on a deployment that never saw one."""
+    since: datetime | None = None
+    """The start of the window. ``None`` means "everything in the ledger"."""
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "tokens": self.tokens,
+            "runs": self.runs,
+            "cost": self.cost.as_json(),
+            "since": self.since.isoformat() if self.since else None,
+        }
+
+
+def usage_of(entries: Iterable[LedgerEntry], since: datetime | None = None) -> UsageSummary:
+    """Add up the debits. THE definition of "what have I used".
+
+    Only USAGE rows: an expiry also takes tokens away, and counting it as consumption would
+    tell somebody they had spent a grant they never touched.
+    """
+    tokens = 0
+    runs = 0
+    cost = Money()
+    for entry in entries:
+        if entry.kind is not EntryKind.USAGE:
+            continue
+        if since is not None and entry.at < since:
+            continue
+        tokens += -entry.tokens
+        runs += 1
+        cost = cost + entry.amount
+    return UsageSummary(tokens=tokens, runs=runs, cost=cost, since=since)
+
+
 def now_utc() -> datetime:
     """UTC, with the timezone attached. A naive datetime in a ledger is a bug waiting for a
     timezone change."""
@@ -670,7 +788,11 @@ def entry_id() -> str:
 
 
 __all__ = [
+    "FREE_PLAN_ID",
+    "FREE_WEEKLY_VALUE",
     "MEMO_BYTES",
+    "MONTH",
+    "WEEK",
     "Balance",
     "BillingError",
     "Cadence",
@@ -691,9 +813,11 @@ __all__ = [
     "SubscriptionStatus",
     "UnknownProductError",
     "Usage",
+    "UsageSummary",
     "balance_of",
     "default_catalog",
     "entry_id",
     "new_invoice_id",
     "now_utc",
+    "usage_of",
 ]

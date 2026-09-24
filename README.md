@@ -56,8 +56,21 @@ Off by default. With `GATEWAY_BILLING__ENABLED=false` — the default — `POST 
 nobody and every existing caller behaves exactly as it did before any of this existed.
 
 **What is sold.** Tokens, because tokens are what a run consumes. Selling seats would mean
-guessing; a subscription is a monthly grant of tokens and a pack is a purchase of them, and
+guessing; a subscription is a periodic grant of tokens and a pack is a purchase of them, and
 the two differ only in shelf life — a grant expires with its period, a purchase never does.
+
+**What is given.** Every account starts on the **free plan**: US$ 5 of tokens a week, granted
+the moment the account is first seen, renewing itself. Paid plans cannot renew themselves —
+nothing here holds a card and a Stellar payment cannot be pulled — but a grant of nothing can
+be given again. The token count is derived from the price of a token rather than written down
+twice, so changing `Pricing.per_million` keeps the free tier worth five dollars a week instead
+of quietly making it a different promise. It needs no payment destination: a gateway can run
+the free tier with nothing but `ENABLED` and `SECRET`.
+
+> The free tier is Sybil-farmable as it stands: an account is a Stellar address and addresses
+> are free to generate. The cheap fix, when it is worth farming, is to require the address to
+> *exist on the ledger* — which costs a base reserve, so it is a real cost rather than a
+> captcha. That check is deliberately not on the sign-in path yet; see `_begin_free`.
 
 **What is charged.** What the run *cost*, marked up, expressed in tokens — not the raw token
 count the model reported. Otherwise switching to a cheaper or dearer model silently rewrites
@@ -102,10 +115,10 @@ which is the only thing that stops an envelope signed for testnet from being acc
 ### The routes
 
 ```
-GET  /billing/plans              public: what is on sale and what a token costs
+GET  /billing/plans              public: what is on sale, what a token costs, which network
 POST /billing/auth/challenge     the text a wallet has to sign
 POST /billing/auth/verify        a signed challenge becomes a session
-GET  /billing                    balance, subscription and recent movements   (bearer)
+GET  /billing                    balance, subscription, usage and movements    (bearer)
 POST /billing/checkout           an invoice with a frozen amount and a memo    (bearer)
 GET  /billing/invoices/{id}      has it been paid? safe to poll                (bearer)
 ```

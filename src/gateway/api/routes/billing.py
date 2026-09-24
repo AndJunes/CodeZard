@@ -76,8 +76,18 @@ AccountDep = Annotated[str, Depends(account_of)]
 
 @router.get("/plans", summary="Everything on sale, and what a token costs")
 async def plans(billing: BillingDep) -> dict[str, Any]:
-    """Public. A price list that needs a login is a price list nobody reads."""
-    return {**billing.catalog.as_json(), "asset": billing.asset, "reserve": billing.reserve}
+    """Public. A price list that needs a login is a price list nobody reads.
+
+    It also names the NETWORK. A browser wallet has to be told which Stellar it is signing
+    for, and the only correct answer is the one this gateway is configured for — a front end
+    guessing it produces signatures that verify nowhere.
+    """
+    return {
+        **billing.catalog.as_json(),
+        "asset": billing.asset,
+        "reserve": billing.reserve,
+        "network": billing.network,
+    }
 
 
 # ── signing in with a wallet ─────────────────────────────────────────────────

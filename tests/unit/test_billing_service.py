@@ -302,7 +302,24 @@ class TestSubscriptions:
 
 
 class TestAuthorizeAndCharge:
-    async def test_an_empty_account_may_not_start_a_run(self, billing: BillingService) -> None:
+    async def test_a_brand_new_account_may_start_a_run_on_the_free_plan(
+        self, billing: BillingService
+    ) -> None:
+        """Every account has the free plan from the moment it is first seen. There is
+        nothing to buy and nothing to accept before the first run."""
+        free = billing.free_plan
+        assert free is not None
+        assert (await billing.authorize(ACCOUNT)).total == free.tokens
+
+    async def test_an_account_that_has_spent_its_grant_may_not(
+        self, billing: BillingService
+    ) -> None:
+        free = billing.free_plan
+        assert free is not None
+        await billing.charge(
+            ACCOUNT, "run-1", Usage(tokens=free.tokens * 4, calls=40, cost=Money.usd(99))
+        )
+
         with pytest.raises(InsufficientFundsError) as raised:
             await billing.authorize(ACCOUNT)
         assert raised.value.available == 0
@@ -311,11 +328,13 @@ class TestAuthorizeAndCharge:
     async def test_a_funded_account_may(
         self, billing: BillingService, network: FakeNetwork
     ) -> None:
+        free = billing.free_plan
+        assert free is not None
         invoice = await billing.checkout(ACCOUNT, "tokens-1m")
         network.pay(invoice)
         await billing.confirm(invoice.id)
 
-        assert (await billing.authorize(ACCOUNT)).total == 1_000_000
+        assert (await billing.authorize(ACCOUNT)).total == 1_000_000 + free.tokens
 
     async def test_charging_debits_what_the_run_cost(
         self, billing: BillingService, network: FakeNetwork
@@ -324,13 +343,14 @@ class TestAuthorizeAndCharge:
         network.pay(invoice)
         await billing.confirm(invoice.id)
 
+        before = (await billing.balance(ACCOUNT)).total
         entry = await billing.charge(
             ACCOUNT, "run-1", Usage(tokens=50_000, calls=4, cost=Money.parse("0.30"))
         )
 
         assert entry is not None
         assert entry.tokens < 0
-        assert (await billing.balance(ACCOUNT)).total == 1_000_000 + entry.tokens
+        assert (await billing.balance(ACCOUNT)).total == before + entry.tokens
 
     async def test_charging_the_same_run_twice_debits_once(self, billing: BillingService) -> None:
         usage = Usage(tokens=50_000, calls=4, cost=Money.parse("0.30"))
@@ -340,7 +360,8 @@ class TestAuthorizeAndCharge:
         assert first is not None
         assert second is not None
         assert first.id == second.id
-        assert len((await billing.view(ACCOUNT)).entries) == 1
+        charges = [e for e in (await billing.view(ACCOUNT)).entries if e.kind is EntryKind.USAGE]
+        assert len(charges) == 1
 
     async def test_charging_may_take_the_balance_to_zero_and_never_refuses(
         self, billing: BillingService
@@ -356,7 +377,8 @@ class TestAuthorizeAndCharge:
     async def test_a_simulated_run_writes_no_row(self, billing: BillingService) -> None:
         """A row that says nothing happened is what an empty ledger already says."""
         assert await billing.charge(ACCOUNT, "run-1", Usage(tokens=5, simulated=True)) is None
-        assert (await billing.view(ACCOUNT)).entries == []
+        entries = (await billing.view(ACCOUNT)).entries
+        assert [e.kind for e in entries] == [EntryKind.GRANT], "only the free week"
 
     async def test_a_run_that_called_nothing_writes_no_row(self, billing: BillingService) -> None:
         assert await billing.charge(ACCOUNT, "run-1", Usage()) is None
@@ -385,10 +407,185 @@ class TestReconcile:
         assert await billing.reconcile() == []
 
 
+async def _rewind(store: SqliteBillingStore, account: str, by: timedelta) -> None:
+    """Move an account's period into the past, as if that much time had gone by.
+
+    Rewinding the subscription rather than patching a clock: `settle_period` asks the real
+    one, and a test that froze time would be testing a different code path from the one that
+    runs. What it does is what a week passing does — the period is over.
+    """
+    subscription = await store.subscription(account)
+    assert subscription is not None
+    await store.put_subscription(
+        replace(
+            subscription,
+            started_at=subscription.started_at - by,
+            renews_at=subscription.renews_at - by,
+        )
+    )
+
+
+class TestTheFreePlan:
+    """Five dollars a week, granted rather than sold, renewing itself."""
+
+    async def test_a_brand_new_account_is_put_on_it_and_granted_its_first_week(
+        self, billing: BillingService
+    ) -> None:
+        view = await billing.view(ACCOUNT)
+        free = billing.free_plan
+        assert free is not None
+
+        assert view.subscription is not None
+        assert view.subscription.plan_id == free.id
+        assert view.balance.granted == free.tokens
+        assert [e.kind for e in view.entries] == [EntryKind.GRANT]
+
+    async def test_reading_the_account_ten_times_grants_one_week(
+        self, billing: BillingService
+    ) -> None:
+        """Settling runs on every read. Without a reference per period this would hand out
+        tokens on every page load."""
+        for _ in range(10):
+            await billing.view(ACCOUNT)
+
+        free = billing.free_plan
+        assert free is not None
+        assert (await billing.balance(ACCOUNT)).granted == free.tokens
+
+    async def test_it_renews_itself_when_the_week_is_over(
+        self, billing: BillingService, store: SqliteBillingStore
+    ) -> None:
+        """A paid plan cannot renew itself — nothing holds a card and a Stellar payment
+        cannot be pulled. A grant of nothing can be given again."""
+        free = billing.free_plan
+        assert free is not None
+        await billing.view(ACCOUNT)
+        await _rewind(store, ACCOUNT, timedelta(days=8))
+
+        view = await billing.view(ACCOUNT)
+
+        assert view.subscription is not None
+        assert view.subscription.status is SubscriptionStatus.ACTIVE
+        assert view.balance.granted == free.tokens
+        assert [e.kind for e in view.entries].count(EntryKind.GRANT) == 2
+
+    async def test_what_was_left_of_last_week_does_not_roll_over(
+        self, billing: BillingService, store: SqliteBillingStore
+    ) -> None:
+        free = billing.free_plan
+        assert free is not None
+        await billing.view(ACCOUNT)
+        await _rewind(store, ACCOUNT, timedelta(days=8))
+
+        view = await billing.view(ACCOUNT)
+
+        assert view.balance.granted == free.tokens, "one week's worth, never two"
+        assert any(e.kind is EntryKind.EXPIRY for e in view.entries)
+
+    async def test_purchased_tokens_survive_the_renewal(
+        self, billing: BillingService, network: FakeNetwork, store: SqliteBillingStore
+    ) -> None:
+        """They were paid for. Only the grant is perishable."""
+        await billing.view(ACCOUNT)  # puts the account on the free plan
+        invoice = await billing.checkout(ACCOUNT, "tokens-1m")
+        network.pay(invoice)
+        await billing.confirm(invoice.id)
+        await _rewind(store, ACCOUNT, timedelta(days=8))
+
+        assert (await billing.view(ACCOUNT)).balance.purchased == 1_000_000
+
+    async def test_buying_a_paid_plan_replaces_the_free_one(
+        self, billing: BillingService, network: FakeNetwork
+    ) -> None:
+        await billing.view(ACCOUNT)
+        invoice = await billing.checkout(ACCOUNT, "starter")
+        network.pay(invoice)
+        await billing.confirm(invoice.id)
+
+        view = await billing.view(ACCOUNT)
+        assert view.subscription is not None
+        assert view.subscription.plan_id == "starter"
+
+    async def test_a_paid_period_that_ends_still_ends(
+        self, billing: BillingService, network: FakeNetwork, store: SqliteBillingStore
+    ) -> None:
+        """The free plan renewing itself must not make paid ones renew themselves too."""
+        invoice = await billing.checkout(ACCOUNT, "starter")
+        network.pay(invoice)
+        await billing.confirm(invoice.id)
+        await _rewind(store, ACCOUNT, timedelta(days=31))
+
+        view = await billing.view(ACCOUNT)
+        assert view.subscription is not None
+        assert view.subscription.status is SubscriptionStatus.EXPIRED
+        assert view.balance.granted == 0
+
+    async def test_a_catalog_without_a_free_plan_grants_nothing(
+        self, store: SqliteBillingStore, network: FakeNetwork
+    ) -> None:
+        catalog = default_catalog()
+        paid_only = type(catalog)(
+            plans=tuple(p for p in catalog.plans if not p.is_free),
+            packs=catalog.packs,
+            pricing=catalog.pricing,
+        )
+        billing = BillingService(store, network, paid_only, "XLM", reserve=1_000)  # type: ignore[arg-type]
+
+        view = await billing.view(ACCOUNT)
+
+        assert billing.free_plan is None
+        assert view.subscription is None
+        assert view.entries == []
+
+
+class TestUsage:
+    async def test_it_counts_what_was_spent_in_this_period(self, billing: BillingService) -> None:
+        await billing.view(ACCOUNT)
+        await billing.charge(ACCOUNT, "run-1", Usage(tokens=9_000, calls=3, cost=Money(1_500)))
+        await billing.charge(ACCOUNT, "run-2", Usage(tokens=4_000, calls=1, cost=Money(500)))
+
+        usage = (await billing.view(ACCOUNT)).usage
+
+        assert usage.runs == 2
+        assert usage.tokens > 0
+        assert usage.cost == Money(2_000)
+        assert usage.since is not None
+
+    async def test_an_expiry_is_not_consumption(
+        self, billing: BillingService, store: SqliteBillingStore
+    ) -> None:
+        """It also takes tokens away. Counting it would tell somebody they had spent a grant
+        they never touched."""
+        await billing.view(ACCOUNT)
+        await _rewind(store, ACCOUNT, timedelta(days=8))
+
+        view = await billing.view(ACCOUNT)
+
+        assert any(e.kind is EntryKind.EXPIRY for e in view.entries)
+        assert view.usage.runs == 0
+        assert view.usage.tokens == 0
+
+    async def test_the_window_moves_with_the_period_and_the_lifetime_does_not(
+        self, billing: BillingService, store: SqliteBillingStore
+    ) -> None:
+        await billing.view(ACCOUNT)
+        await billing.charge(ACCOUNT, "run-1", Usage(tokens=9_000, calls=3, cost=Money(100)))
+        await _rewind(store, ACCOUNT, timedelta(days=8))
+
+        view = await billing.view(ACCOUNT)
+
+        assert view.usage.runs == 0, "last week's runs are not this week's"
+        assert view.lifetime.runs == 1
+
+
 class TestView:
     async def test_it_reads_balance_subscription_and_movements_at_once(
         self, billing: BillingService, network: FakeNetwork
     ) -> None:
+        # `authorize` first, because that is the order a run happens in and the one the
+        # usage window is defined against: a charge that predates the account's first period
+        # predates the account.
+        await billing.authorize(ACCOUNT)
         invoice = await billing.checkout(ACCOUNT, "tokens-1m")
         network.pay(invoice)
         await billing.confirm(invoice.id)
@@ -398,7 +595,9 @@ class TestView:
 
         assert body["account"] == ACCOUNT
         assert body["balance"]["total"] > 0
-        assert [e["kind"] for e in body["entries"]] == ["purchase", "usage"]
+        assert [e["kind"] for e in body["entries"]] == ["grant", "purchase", "usage"]
+        assert body["usage"]["runs"] == 1
+        assert body["plan"]["free"] is True
 
 
 async def test_a_credit_cannot_be_negative(billing: BillingService) -> None:

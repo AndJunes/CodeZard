@@ -21,6 +21,7 @@ from gateway.config.settings import (
     ServiceSettings,
     Settings,
 )
+from gateway.domain.billing import Money, Usage
 from gateway.domain.x402 import SCHEME, X402_VERSION
 
 ACCOUNT = "G" + "A" * 55
@@ -114,10 +115,25 @@ class TestCatalogue:
         assert body["packs"]
         assert body["asset"] == "XLM"
 
-    async def test_every_price_is_a_real_number(self, paid_client: httpx.AsyncClient) -> None:
+    async def test_every_paid_price_is_a_real_number(self, paid_client: httpx.AsyncClient) -> None:
         body = (await paid_client.get("/billing/plans")).json()
         for product in [*body["plans"], *body["packs"]]:
+            assert int(product["tokens"]) > 0
+            if product.get("free"):
+                continue
             assert int(product["price"]["micros"]) > 0
+
+    async def test_the_free_plan_is_on_the_list_and_says_it_is_weekly(
+        self, paid_client: httpx.AsyncClient
+    ) -> None:
+        body = (await paid_client.get("/billing/plans")).json()
+        free = [p for p in body["plans"] if p["free"]]
+
+        assert len(free) == 1
+        assert free[0]["cadence"] == "weekly"
+        assert free[0]["period_days"] == 7
+        assert int(free[0]["price"]["micros"]) == 0
+        assert int(free[0]["tokens"]) > 0
 
 
 class TestSignIn:
@@ -159,9 +175,10 @@ class TestAccount:
         response = await paid_client.get("/billing", headers={"authorization": "Bearer made.up"})
         assert response.status_code == 401
 
-    async def test_a_signed_in_account_reads_empty_and_not_missing(
+    async def test_a_signed_in_account_starts_on_the_free_plan(
         self, paid_app: FastAPI, paid_client: httpx.AsyncClient
     ) -> None:
+        """Nothing to buy and nothing to accept: the first read puts the account on it."""
         response = await paid_client.get(
             "/billing", headers={"authorization": f"Bearer {session_token(paid_app)}"}
         )
@@ -169,9 +186,30 @@ class TestAccount:
         assert response.status_code == 200
         body = response.json()
         assert body["account"] == ACCOUNT
-        assert body["balance"]["total"] == 0
-        assert body["subscription"] is None
-        assert body["entries"] == []
+        assert body["subscription"]["plan"] == "free"
+        assert body["plan"]["free"] is True
+        assert body["balance"]["granted"] > 0
+        assert [e["kind"] for e in body["entries"]] == ["grant"]
+
+    async def test_it_reports_usage_and_not_only_a_balance(
+        self, paid_app: FastAPI, paid_client: httpx.AsyncClient
+    ) -> None:
+        billing = paid_app.state.container.billing
+        await billing.authorize(ACCOUNT)
+        await billing.charge(
+            ACCOUNT, "run-1", Usage(tokens=9_000, calls=3, cost=Money.parse("0.02"))
+        )
+
+        body = (
+            await paid_client.get(
+                "/billing", headers={"authorization": f"Bearer {session_token(paid_app)}"}
+            )
+        ).json()
+
+        assert body["usage"]["runs"] == 1
+        assert body["usage"]["tokens"] > 0
+        assert body["usage"]["since"] is not None
+        assert body["lifetime"]["runs"] == 1
 
 
 class TestCheckout:
@@ -330,9 +368,28 @@ class TestThePaymentGate:
         assert "error" in body
         assert body["accepts"][0]["payTo"] == DESTINATION
 
-    async def test_a_signed_in_caller_with_no_balance_is_told_the_price_too(
+    async def test_a_signed_in_caller_gets_through_on_the_free_plan(
         self, paid_app: FastAPI, paid_client: httpx.AsyncClient
     ) -> None:
+        """No purchase, no payment: the free week is granted the moment they are seen."""
+        response = await paid_client.post(
+            "/runs",
+            json={"idea": "a bike workshop tracker"},
+            headers={"authorization": f"Bearer {session_token(paid_app)}"},
+        )
+
+        assert response.status_code != 402
+
+    async def test_a_signed_in_caller_who_spent_the_week_is_told_the_price(
+        self, paid_app: FastAPI, paid_client: httpx.AsyncClient
+    ) -> None:
+        billing = paid_app.state.container.billing
+        free = billing.free_plan
+        await billing.authorize(ACCOUNT)
+        await billing.charge(
+            ACCOUNT, "run-0", Usage(tokens=free.tokens * 8, calls=99, cost=Money.usd(200))
+        )
+
         response = await paid_client.post(
             "/runs",
             json={"idea": "a bike workshop tracker"},

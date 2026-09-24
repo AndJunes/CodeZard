@@ -193,11 +193,11 @@ class BillingSettings(BaseModel):
     def _sellable(self) -> Self:
         if not self.enabled:
             return self
-        if not self.destination:
-            raise ValueError(
-                "billing is on but GATEWAY_BILLING__DESTINATION is empty: "
-                "there is nowhere for a payment to go"
-            )
+        # `destination` is NOT required here, and that is deliberate: the free plan is
+        # granted rather than sold, so a deployment can run the free tier with nothing but a
+        # secret. Requiring a Stellar address before anybody can be given five dollars a week
+        # of tokens is friction that buys nothing. Checkout and x402 refuse on their own when
+        # there is nowhere to send a payment, which is the moment it actually matters.
         if not self.secret.get_secret_value():
             raise ValueError(
                 "billing is on but GATEWAY_BILLING__SECRET is empty: "
